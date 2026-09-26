@@ -1,0 +1,21 @@
+# research/ and PLAN.md are local working material, not deliverables.
+# research/ holds throwaway recon notes, probe scripts and machine-generated
+# inventories; PLAN.md is a working build plan that churns daily. Both are kept
+# out of the repository so the tracked tree contains only shippable files.
+/research/
+/PLAN.md
+
+# Python build / cache artefacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+build/
+dist/
+.coverage
+htmlcov/

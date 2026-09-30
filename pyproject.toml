@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=65.5.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vm-mcp"
+version = "0.0.0"
+description = "MCP server for inspecting and controlling a local VMware Workstation GOAD lab"
+readme = "README.md"
+requires-python = ">=3.10"
+
+# Pinned exactly, not with >=. The MCP Python SDK is on a v2 line that
+# renamed FastMCP to MCPServer and moved mcp.server.fastmcp; an unbounded
+# requirement is how the pre-existing kali_mcp project in this lab ended up
+# with an import error on a fresh install. See M0 issue #1.
+dependencies = [
+    "mcp[cli]==2.2.0",
+    "psutil==7.2.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.4.2",
+]
+
+[project.scripts]
+vm-mcp = "vm_mcp.test_server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

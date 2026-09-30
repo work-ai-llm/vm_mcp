@@ -1,0 +1,33 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  // Project-local opencode config for this repo. Lives next to the code so it
+  // is version-controlled and travels with the project, instead of living in
+  // the user's global config at C:\Users\Zver\.config\opencode\.
+  //
+  // The server is registered as REMOTE, not local. That is the important part:
+  // opencode is told where to reach an already-running server and never spawns
+  // it, so opencode starting and stopping has no effect on the server, and a
+  // crash in opencode cannot take the lab tools down with it.
+  //
+  // Start the server yourself first:
+  //   .venv\Scripts\python.exe -m vm_mcp.test_server --transport http
+  // It prints the URL it is serving on, plus a warning: this endpoint has no
+  // authentication, so anything that can reach it can call every tool. The
+  // bind is loopback for that reason. Do not widen the bind without settling
+  // the auth question first.
+  //
+  // The port below must match DEFAULT_HTTP_PORT in src/vm_mcp/test_server.py.
+  // There is no environment variable that could change one without the other.
+  "mcp": {
+    "vmware": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8765/mcp",
+      "enabled": true,
+
+      // The measured handshake is ~1.6 s, so the 5000 ms default would work.
+      // Raised to 15000 for headroom on a cold start.
+      "timeout": 15000
+    }
+  }
+}

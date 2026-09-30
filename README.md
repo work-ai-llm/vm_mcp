@@ -11,17 +11,21 @@ Windows domain controller looks like from the outside.
 
 ## Status
 
-**Research and planning only. Nothing is implemented.** There is no server, no
-`pyproject.toml`, no source tree and no installed package in this repository. The
-tracked content is a `.gitignore` and this README. No MCP tools exist yet, and no
-claim in this README should be read as describing working software.
+**M0 foundation complete. The server runs and speaks MCP. It cannot touch a VM yet.**
 
-What *does* exist is the research that the design is based on: every control operation
-this server intends to wrap was executed against the real lab and its behaviour and
-timings recorded. That research is deliberately untracked and lives in `PLAN.md` and
-`research/`. The first code milestone is the SDK handshake — the current MCP Python SDK
-is a breaking rewrite, so "does a trivial tool round-trip at all" is not yet a
-guaranteed yes.
+What exists and works: a stdio and an HTTP transport, a real tool round-trip
+(`ping`, `add`), and a test suite that spawns the server as a subprocess and
+speaks the protocol to it over its pipes with nothing mocked. Verified
+end to end: 14 tests pass, and opencode connects to the running server over
+HTTP and lists both tools.
+
+The tools that do anything useful are not built. `ping` and `add` are
+plumbing proofs. No VMware instrument is invoked anywhere in the current code,
+so no VM can be affected by anything in this repository yet.
+
+The research that the design is based on — every control operation this server
+intends to wrap, executed against the real lab with timings recorded — lives in
+`PLAN.md` and `research/`, and is deliberately untracked.
 
 ## Planned tool surface
 
@@ -52,10 +56,16 @@ but wedged reports as `degraded`, not `up`.
    `vagrant global-status` was observed reporting all six VMs as running while none
    were.
 
-2. **stdio transport only — no port, no listener, no auth surface.** The whole point of
-   this server is that it can power off a domain controller. It should therefore not be
-   listening on a socket for anything to connect to. Remote/HTTP transport is out of
-   scope by design, not by omission.
+2. **Two transports over one tool surface, loopback-only by default.** stdio is the default
+   because it opens no port: the client spawns the process and owns its lifetime, so a
+   server that can power off a domain controller is not sitting on a socket waiting for
+   anything. `--transport http` exists for a different reason: a client that should not
+   control the server's lifetime, and a second machine that needs to reach the same
+   server. The server binds `127.0.0.1` by default. Widening the bind address to
+   `0.0.0.0` is a deliberate flag and is not reachable by accident, because the whole
+   threat this project is aimed at is a prompt-injected agent deciding to power off a DC.
+   Both transports expose an identical tool surface, so nothing in a tool definition
+   knows or cares which one carried the call.
 
 3. **The MCP Python SDK is pinned to v2 (`mcp==2.2.0`).** v2 is a breaking rewrite in
    which `FastMCP` was removed; the API is `from mcp.server import MCPServer` with
@@ -71,54 +81,140 @@ but wedged reports as `degraded`, not `up`.
    arbitrary-file-primitive with a power switch on it. Paths are pinned, not discovered
    by globbing — a glob would happily accept a path outside the lab.
 
-## Intended usage
+## Usage
 
-The server is registered as a *local* stdio server in the opencode client config, as an
-argument array rather than a shell string. Shape of the eventual config:
+The server is registered in **`opencode.jsonc` at the repository root** — project-local,
+version-controlled, and travelling with the code. It is *not* written into the user's
+global config at `C:\Users\Zver\.config\opencode\`.
+
+Two ways to run it, and the choice determines how the client behaves.
+
+### Remote (what the committed config uses)
+
+Start the server yourself; opencode only connects.
+
+```powershell
+# Terminal 1 — the server, running independently
+.venv\Scripts\python.exe -m vm_mcp.test_server --transport http
+
+# Terminal 2 — opencode, from this directory
+opencode
+```
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
     "vmware": {
-      "type": "local",
-      // PLACEHOLDER PATHS — this project's venv does not exist yet.
-      // command[0] is the venv interpreter by absolute path so nothing
-      // depends on PATH resolution.
-      "command": [
-        "D:\\llms\\models\\testing\\vm_mcp\\.venv\\Scripts\\python.exe",
-        "-u",
-        "D:\\llms\\models\\testing\\vm_mcp\\src\\vm_mcp\\server.py"
-      ],
-      "cwd": "D:\\llms\\models\\testing\\vm_mcp",
-      "environment": {
-        "VMRUN_PATH": "C:\\Program Files (x86)\\VMware\\VMware Workstation\\vmrun.exe"
-      },
+      "type": "remote",
+      "url": "http://127.0.0.1:8765/mcp",
       "enabled": true,
       "timeout": 15000
     }
-  },
-  "tools": {
-    "vmware_list_vms": true,
-    "vmware_vm_status": true,
-    "vmware_host_resources": true,
-    "vmware_guest_health": true,
-
-    "vmware_start_vm": false,
-    "vmware_stop_vm": false,
-    "vmware_restart_vm": false
   }
 }
 ```
 
-Those paths are **placeholders**. No virtualenv has been created, no dependencies are
-installed, and `src/vm_mcp/server.py` does not exist, so this block will not work as
-written. `VMRUN_PATH` is pinned rather than discovered so the server cannot silently
-bind to a different hypervisor install. `timeout` covers startup and the tools
-handshake, not individual tool calls.
+There is no `command` and no `cwd` here, because opencode is not running anything. It
+holds a URL. Consequences worth being explicit about: the server outlives any client,
+several clients can share one server, and a crash in opencode cannot take the lab tools
+down. The flip side is that the server must be started separately — with nothing running
+on the port, opencode reports `✗ failed` and offers no tools.
 
-Note also that the mutating tools default to `false` above, and guest credentials are
-optional environment variables — never committed to a config file.
+### Local stdio (spawned by the client)
+
+```jsonc
+{
+  "mcp": {
+    "vmware": {
+      "type": "local",
+      "command": [
+        "D:\\llms\\models\\testing\\vm_mcp\\.venv\\Scripts\\python.exe",
+        "-u",
+        "-m", "vm_mcp.test_server"
+      ],
+      "cwd": "D:\\llms\\models\\testing\\vm_mcp",
+      "enabled": true,
+      "timeout": 15000
+    }
+  }
+}
+```
+
+`command` is an argument array, not a shell string: element 0 is the executable, the rest
+are its arguments. `cwd` is the working directory the process is started in, which is what
+relative paths inside the server resolve against. The absolute interpreter path is
+deliberate, so nothing depends on `PATH` resolution finding the right Python.
+
+### How the model learns what to call
+
+Worth being clear about, because the config does not say it. The config only says **where
+the server is**. The tool surface is discovered at runtime: opencode performs the MCP
+handshake, the server answers `tools/list` with a name, a description and a JSON Schema
+per tool, and opencode puts those into the model's context as callable functions. The
+model picks from what was advertised; it is not guessing and nothing is hardcoded
+client-side. The SDK derives the schema from the Python signature and the docstring,
+which is why the docstrings on `ping` and `add` are written as tool documentation
+rather than as code comments.
+
+### Transports and settings
+
+`--transport stdio` (the default), `--host`, `--port`, `--path`. Defaults come from
+module constants at the top of `src/vm_mcp/test_server.py` — `DEFAULT_HTTP_HOST`,
+`DEFAULT_HTTP_PORT`, `DEFAULT_HTTP_PATH` — and are printed on every HTTP start:
+
+```
+--transport stdio   (default)   client launches the process; no port is opened
+--host    127.0.0.1             loopback: only this machine can reach it
+--port    8765
+--path    /mcp                  arbitrary; the client is handed the URL
+```
+
+The endpoint path is not fixed by the protocol. `/mcp` is the SDK's convention, not a
+requirement — `--path /vm_run_mcp` works identically, because the client is simply
+given that URL. Distinct paths are how you would route several servers behind one
+reverse proxy later.
+
+**There is no environment-variable configuration.** Settings live in the source file
+on purpose. An environment variable is invisible configuration: it gets set in a shell
+profile, outlives the reason it was set, and the server then listens somewhere the
+source does not mention. A regression test pins that behaviour, so `VM_MCP_*` in the
+environment cannot change how the server starts.
+
+## Security posture
+
+**HTTP transport currently has no authentication.** No token, no TLS, no client identity
+check. Anything that can reach the socket can call every tool the server exposes. The
+server says so on startup, in the banner, on every HTTP launch — because the tool surface
+is about to include power-off, and "I bound it to loopback" is a mitigation, not a control.
+Authentication has to be settled before the bind is widened off this machine.
+
+The mutating tools are intended to ship disabled by default in client configuration,
+gated behind an explicit per-agent opt-in — the `tools` block, not the server, is where
+that switch lives:
+
+```jsonc
+"tools": {
+  "vmware_list_vms": true,
+  "vmware_vm_status": true,
+  "vmware_host_resources": true,
+  "vmware_guest_health": true,
+
+  "vmware_start_vm": false,
+  "vmware_stop_vm": false,
+  "vmware_restart_vm": false
+}
+```
+
+Tool annotations are hints to the model about what a call does. They are **not** access
+control: nothing enforces them, they carry no authorisation, and a caller that ignores
+them gets the same response. The real controls are the closed allowlist that turns a VM
+name into a path, the no-shell subprocess layer, and this client-side gating.
+
+The plan is to reach the server from a second machine over Tailscale. That is a
+bind-address change (`--host 0.0.0.0`) plus an authentication story, not a redesign —
+which is the main reason the HTTP transport exists alongside stdio. Guest credentials,
+when they are needed, are environment variables and never belong in a committed config.
 
 ## Lab
 
@@ -153,7 +249,8 @@ are reading this on GitHub and want that context, it is on the author's machine.
 
 ## Repository scope
 
-This repository currently contains documentation and git configuration only. Adding
-`LICENSE`, CI and contributor documentation is deliberately deferred — there is nothing
-to license or build yet, and inventing a license before the first line of code is
-committed is a decision that should be made deliberately rather than by a scaffold.
+This repository currently contains the server, its tests and its project-local opencode
+config. Adding `LICENSE`, CI and contributor documentation is deliberately deferred —
+there is nothing to license or build yet, and inventing a license before the first line
+of code is committed is a decision that should be made deliberately rather than by a
+scaffold.

@@ -24,7 +24,7 @@ dev = [
 ]
 
 [project.scripts]
-vm-mcp = "vm_mcp.test_server:main"
+vm-mcp = "vm_mcp.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

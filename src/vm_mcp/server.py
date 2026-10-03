@@ -1,0 +1,458 @@
+"""vm_mcp — MCP server for a local VMware Workstation lab.
+
+MILESTONE 1: read-only inspection. Two tools are exposed, `list_vms` and
+`vm_status`, and neither of them can change a VM's state. Mutating tools land
+later and are gated on the allowlist design in issue #15.
+
+Where the data comes from
+-------------------------
+* *Which VMs exist* — `roster.py` reads the VMware Workstation registry
+  (`inventory.vmls`), the same file the GUI uses to build its library.
+* *Which VMs are running* — one `vmrun -T ws list` call.
+* *Per-VM configuration* — the VM's own `.vmx` file, parsed read-only.
+
+Two sources for power state would be tempting and are not used: the registry
+has no notion of running state, and vmrun has no notion of existence. Each
+supplies the one thing the other cannot.
+
+Two transports, one tool surface
+--------------------------------
+`--transport stdio` (the default) speaks JSON-RPC over stdin/stdout. The MCP
+client launches this process and owns its lifetime. Nothing is reachable.
+
+`--transport http` runs this as a standalone service. The client is handed a
+URL and never spawns a process, which is what opencode is configured to use.
+
+Both carry an identical tool surface.
+
+Startup discipline
+------------------
+Diagnostics go to stderr, never stdout: on stdio, stdout is the JSON-RPC channel
+and a stray print corrupts the framing. And nothing blocking happens at import
+time, because OpenCode budgets 5000 ms for the tools/list handshake. The
+registry is read in `main()`, not at module scope.
+
+Module layout
+-------------
+This file is `server.py`, not `vm_mcp.py`. A module named after the package it
+lives in shadows it: running `python vm_mcp.py` from inside this directory puts
+this directory on `sys.path`, so `from vm_mcp import roster` below resolves to
+*this file* instead of the package and fails with an ImportError that reads like
+a circular import. It is not one. Launch with any of:
+
+    python -m vm_mcp                    # shortest
+    python -m vm_mcp.server
+    vm-mcp                               # console script, from the venv
+
+`__main__.py` exists so the shortest form works.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+from mcp.server import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import ToolAnnotations
+
+from vm_mcp import roster
+from vm_mcp.vmrun import VmrunUnavailable, list_running_vmx, tools_state
+
+__version__ = "0.1.0"
+
+# HTTP settings live here as plain module constants, read by the CLI defaults
+# and printed at startup. Deliberately not read from the environment: an
+# environment variable is invisible configuration. It gets set in some shell
+# profile or launcher, outlives the reason it was set, and the server then
+# listens somewhere the config file does not mention.
+#
+# Loopback is the default because binding 0.0.0.0 would expose a server that can
+# inspect a domain controller lab to anything that can route to this machine.
+# Widening the bind has to be a deliberate flag.
+DEFAULT_HTTP_HOST = "127.0.0.1"
+DEFAULT_HTTP_PORT = 8765
+DEFAULT_HTTP_PATH = "/mcp"
+
+# `.vmx` is a flat key = "value" file. Keys are matched case-insensitively
+# because real files disagree with themselves: `wazuh-4.7.5.vmx` has
+# `displayname` and the Ubuntu VM has `displayName`. A case-sensitive pattern
+# silently returns nothing for half the lab, which looks exactly like "this VM
+# has no name".
+_VMX_FIELD_RE = re.compile(r'^\s*([A-Za-z0-9_.]+)\s*=\s*"(.*)"\s*$', re.MULTILINE)
+
+# How much of a .vmx to read. The interesting keys sit at the top; the file can
+# run to hundreds of KB with disk descriptors further down.
+_VMX_READ_BYTES = 65536
+
+POWER_STOPPED = "stopped"
+POWER_RUNNING = "running"
+POWER_UNKNOWN = "unknown"
+
+TOOLS_OFFLINE = "undetermined (vm powered off)"
+
+mcp = MCPServer(
+    name="vmware",
+    version=__version__,
+    instructions=(
+        "Inspects a local VMware Workstation lab: Windows domain controllers, "
+        "servers, and Linux hosts. Call list_vms to see what is registered and "
+        "what is running, then vm_status for the detail of one VM. This "
+        "milestone is read-only; no tool changes a VM's state."
+    ),
+)
+
+READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False)
+
+
+def _norm_path(path: str) -> str:
+    """Normalize a .vmx path for comparison between vmrun and the registry.
+
+    Verified: on the M0 host the paths vmrun prints match the registry byte for
+    byte. This normalization is insurance against a future release changing
+    slash direction or case, not a workaround for an observed mismatch.
+    """
+    return path.replace("/", "\\").lower()
+
+
+def _read_vmx_fields(vmx_path: str) -> dict[str, str]:
+    """Parse the top of a `.vmx` into a lowercase-keyed field dict.
+
+    Returns an empty dict if the file is missing or unreadable; the caller
+    decides whether that is fatal.
+    """
+    try:
+        with open(vmx_path, "r", encoding="utf-8", errors="replace") as handle:
+            head = handle.read(_VMX_READ_BYTES)
+    except OSError:
+        return {}
+
+    fields: dict[str, str] = {}
+    for key, value in _VMX_FIELD_RE.findall(head):
+        fields.setdefault(key.lower(), value.strip())
+    return fields
+
+
+async def _power_states(
+    vms: tuple[roster.RegisteredVm, ...],
+) -> tuple[dict[str, str], str | None]:
+    """Ask VMware which of `vms` are running.
+
+    Returns a mapping of normalized .vmx path to power state, plus the error
+    message if VMware could not be reached.
+
+    An unreachable vmrun yields `unknown` for every VM, never `stopped`. The
+    distinction matters: "not in the running list" and "could not ask" collapse
+    to the same answer otherwise, and during a host fault the server would
+    confidently report a powered-on domain controller as off.
+    """
+    try:
+        running = await list_running_vmx()
+    except VmrunUnavailable as exc:
+        return {_norm_path(vm.vmx): POWER_UNKNOWN for vm in vms}, str(exc)
+
+    running_norm = {_norm_path(path) for path in running}
+    return (
+        {
+            _norm_path(vm.vmx): (
+                POWER_RUNNING
+                if _norm_path(vm.vmx) in running_norm
+                else POWER_STOPPED
+            )
+            for vm in vms
+        },
+        None,
+    )
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def list_vms() -> dict[str, Any]:
+    """List every VM registered with VMware Workstation and whether it is running.
+
+    Takes no arguments. Reads the VMware library registry and asks VMware
+    Workstation which VMs are powered on.
+
+    Returns:
+        A dict with:
+          vms: one entry per registered VM, each with `name` (display name;
+              renamable and not unique), `uuid` (stable hardware identifier --
+              use this to refer to a VM unambiguously), `vmx` (path to its
+              config file), and `power_state`.
+          counts: total registered, and how many are running.
+          observed_via: `vmrun-list` when power state came from VMware, or
+              `unavailable` if VMware could not be queried -- in which case
+              every `power_state` is `unknown` rather than guessed.
+
+    Note:
+        Lists what VMware Workstation knows about: VMs registered on this user
+        account. A .vmx started directly with vmrun without being registered
+        will not appear.
+    """
+    snapshot = roster.refresh()
+
+    if not snapshot.ok:
+        return {
+            "vms": [],
+            "counts": {"total": 0, "running": 0},
+            "observed_via": "unavailable",
+            "registry_error": snapshot.error,
+        }
+
+    states, vmrun_error = await _power_states(snapshot.vms)
+
+    entries = [
+        {
+            "name": vm.name,
+            "uuid": vm.uuid,
+            "vmx": vm.vmx,
+            "power_state": states.get(_norm_path(vm.vmx), POWER_UNKNOWN),
+        }
+        for vm in snapshot.vms
+    ]
+
+    return {
+        "vms": entries,
+        "counts": {
+            "total": len(entries),
+            "running": sum(
+                1 for e in entries if e["power_state"] == POWER_RUNNING
+            ),
+        },
+        "observed_via": "unavailable" if vmrun_error else "vmrun-list",
+        **({"vmrun_error": vmrun_error} if vmrun_error else {}),
+    }
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def vm_status(uuid: str | None = None, name: str | None = None) -> dict[str, Any]:
+    """Report the configuration and power state of one VM.
+
+    Identifies the VM by `uuid` (preferred, unambiguous) or `name` (display
+    name, convenient but not unique). Reads the VM's `.vmx` file for CPU and
+    memory, and asks VMware Workstation for power state.
+
+    Args:
+        uuid: The VM's hardware UUID, as reported by `list_vms`. Spaced or
+            undashed forms both work. Survives a display-name rename.
+        name: Display name. Use when the UUID is not known. An ambiguous name
+            is an error listing the candidates, not a guess.
+
+    Returns:
+        A dict with:
+          name, uuid, vmx: identity, from the VMware registry.
+          power_state: `running`, `stopped`, or `unknown` if VMware could not be
+              queried.
+          vcpu: Configured virtual CPU count. A setting, not current CPU load.
+          mem_mb: Configured memory in megabytes. A ceiling the VM is allowed to
+              use, not current usage -- a stopped VM reports this number while
+              using none of it.
+          guest_os: The guest operating system identifier, e.g.
+              `windows9srv-64` or `ubuntu-64`. Read from the .vmx because the
+              registry's own copy of this is unreliable.
+          tools_state: VMware Tools state. `running` when the guest agent is
+              active, `installed` when present but the VM is off. Says nothing
+              about a powered-off guest, so it is reported as undetermined
+              rather than guessed.
+          vmx_exists: False if the registry lists a VM whose .vmx is missing,
+              meaning the registry is stale for that entry.
+
+    On an unresolvable identifier the call fails with `is_error=True` and no
+    VMware process is started.
+    """
+    try:
+        vm = roster.resolve(uuid=uuid, name=name)
+    except roster.AmbiguousName as exc:
+        raise ToolError(str(exc)) from exc
+    except roster.RosterError as exc:
+        raise ToolError(str(exc)) from exc
+
+    states, vmrun_error = await _power_states((vm,))
+    power = states.get(_norm_path(vm.vmx), POWER_UNKNOWN)
+
+    vmx_exists = Path(vm.vmx).is_file()
+    fields = _read_vmx_fields(vm.vmx) if vmx_exists else {}
+
+    result: dict[str, Any] = {
+        "name": vm.name,
+        "uuid": vm.uuid,
+        "vmx": vm.vmx,
+        "power_state": power,
+        "vmx_exists": vmx_exists,
+    }
+
+    # Configured resources, reported only when the .vmx was readable. Absent is
+    # more honest than zero, which would read as "this VM has no memory".
+    for key, field in (("numvcpus", "vcpu"), ("memsize", "mem_mb")):
+        raw = fields.get(key)
+        if raw is None:
+            continue
+        try:
+            result[field] = int(raw)
+        except ValueError:
+            result[field] = None
+
+    if "guestos" in fields:
+        result["guest_os"] = fields["guestos"]
+    if "displayname" in fields:
+        result["display_name"] = fields["displayname"]
+
+    # VMware Tools is only meaningful for a running guest. Calling
+    # checkToolsState on a powered-off VM costs 0.65-3.5s to learn `installed`,
+    # so the call is skipped and the answer is stated as unavailable.
+    if power == POWER_RUNNING:
+        try:
+            result["tools_state"] = await tools_state(vm.vmx)
+        except VmrunUnavailable as exc:
+            result["tools_state"] = f"unavailable: {exc}"
+    else:
+        result["tools_state"] = TOOLS_OFFLINE
+
+    if vmrun_error:
+        result["vmrun_error"] = vmrun_error
+
+    return result
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse the command line. Defaults come from the module constants above.
+
+    stdio is the default transport: it opens no port, so a server that can
+    inspect a domain controller lab is not sitting on a socket waiting for
+    anything.
+    """
+    parser = argparse.ArgumentParser(
+        prog="vm-mcp",
+        description="MCP server for a local VMware Workstation lab.",
+    )
+    parser.add_argument(
+        "--transport",
+        choices=("stdio", "http"),
+        default="stdio",
+        help="stdio: the client launches this process. http: serve and wait to "
+        "be connected to. Default: stdio.",
+    )
+    parser.add_argument(
+        "--host",
+        default=DEFAULT_HTTP_HOST,
+        help=f"HTTP bind address. Default: {DEFAULT_HTTP_HOST} (loopback only).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_HTTP_PORT,
+        help=f"HTTP port. Default: {DEFAULT_HTTP_PORT}.",
+    )
+    parser.add_argument(
+        "--path",
+        default=DEFAULT_HTTP_PATH,
+        help=f"HTTP endpoint path. Default: {DEFAULT_HTTP_PATH}.",
+    )
+    return parser.parse_args(argv)
+
+
+def http_banner(host: str, port: int, path: str) -> str:
+    """The startup message for HTTP mode: settings, URL, and a security warning.
+
+    Printed on every HTTP start. There is no authentication on this transport,
+    so anyone who can reach the socket can call every tool on it -- and the tool
+    surface is going to include power-off. Worth saying when it becomes true.
+    """
+    if host in ("127.0.0.1", "localhost", "::1"):
+        exposure = "bound to loopback, so only processes on this machine can reach it"
+    else:
+        exposure = (
+            f"bound to {host}, which is reachable by anything that can route to "
+            "this machine"
+        )
+
+    return "\n".join(
+        [
+            f"vm_mcp {__version__} — HTTP transport",
+            "",
+            f"  host      : {host}",
+            f"  port      : {port}",
+            f"  path      : {path}",
+            f"  url       : http://{host}:{port}{path}",
+            "",
+            "  SECURITY: no authentication is established on this endpoint. "
+            "There is no token,",
+            "  no TLS and no client identity check, so anything that can reach "
+            "the socket can call",
+            "  every tool this server exposes. The tools shipped so far are "
+            "read-only, but once the",
+            "  mutating tools land, this endpoint will be able to power off a "
+            "domain controller and",
+            f"  anyone who can reach it can ask for that. Currently {exposure}.",
+            "",
+        ]
+    )
+
+
+def _port_is_free(host: str, port: int) -> bool:
+    """True if nothing is already listening on host:port.
+
+    A second server on the same port does not fail loudly; the OS hands the
+    socket to the first process and the second dies with a bind error that
+    scrolls past in a launcher window. Checking up front lets it explain itself.
+    """
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind((host, port))
+        except OSError:
+            return False
+    return True
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+
+    # Warm the registry cache once, here, rather than on the first tool call.
+    # Under a millisecond, and it keeps the first call free of file I/O. Failure
+    # is not fatal: the tools report the registry error themselves.
+    snapshot = roster.refresh()
+    if snapshot.ok:
+        print(
+            f"vm_mcp: VMware registry: {len(snapshot.vms)} VMs registered",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        print(
+            f"vm_mcp: VMware registry unavailable: {snapshot.error}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    if args.transport == "http":
+        if not _port_is_free(args.host, args.port):
+            print(
+                f"vm_mcp {__version__}: {args.host}:{args.port} is already in use. "
+                "A server may already be running here -- if so, that is fine, "
+                "just connect to it. Otherwise pass --port to pick another.",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise SystemExit(1)
+
+        # stderr, never stdout. See the module docstring.
+        print(http_banner(args.host, args.port, args.path), file=sys.stderr, flush=True)
+        mcp.run(
+            transport="streamable-http",
+            host=args.host,
+            port=args.port,
+            streamable_http_path=args.path,
+        )
+        return
+
+    print(f"vm_mcp {__version__} starting on stdio", file=sys.stderr, flush=True)
+    mcp.run()
+
+
+if __name__ == "__main__":
+    main()

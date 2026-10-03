@@ -399,6 +399,145 @@ def test_ambiguous_substring_is_an_error_not_a_guess(
     assert len(excinfo.value.candidates) > 1
 
 
+def test_ambiguity_error_explains_why_each_candidate_matched(
+    loaded: roster.RosterSnapshot,
+) -> None:
+    """A bare list of names gives the caller no way to work out the collision.
+
+    Asked for `GOAD`, the two domain controllers match on their own display
+    names but `wazuh-4.7.5` does not -- so the message has to say which alias
+    each VM matched on, or the caller cannot tell a real collision from noise.
+    """
+    with pytest.raises(roster.AmbiguousName) as excinfo:
+        roster.resolve(name="WindowsServer2019")
+
+    reasons = dict(excinfo.value.matches)
+    assert reasons["provider: GOAD-DC01"] == "its .vmx filename 'WindowsServer2019'"
+    assert "display name" in reasons["provider: GOAD-DC02"] or (
+        reasons["provider: GOAD-DC02"] == "its .vmx filename 'WindowsServer2019'"
+    )
+
+
+def test_ambiguity_reason_distinguishes_display_name_from_vmx_filename() -> None:
+    """The reason is the point of the feature, so pin the two shapes directly."""
+    named = roster.RegisteredVm(
+        name="provider: GOAD-DC01", uuid="a" * 32, vmx=r"C:\lab\WindowsServer2019.vmx"
+    )
+    reason = roster._matching_alias(named, "GOAD-DC01")
+    assert reason is not None
+    assert reason[1] == "its display name without the 'provider:' prefix"
+
+    by_stem = roster._matching_alias(named, "WindowsServer2019")
+    assert by_stem is not None
+    assert by_stem[1] == "its .vmx filename 'WindowsServer2019'"
+
+    assert roster._matching_alias(named, "nothing-like-this") is None
+
+
+def test_substring_ambiguity_reports_the_alias_that_matched(
+    loaded: roster.RosterSnapshot,
+) -> None:
+    """A substring collision must be distinguishable from an exact one.
+
+    `GOAD` is inside two display names but is neither of them, and a message
+    rendering the candidates without that distinction reads as though the
+    registry contains two VMs actually called "GOAD".
+    """
+    with pytest.raises(roster.AmbiguousName) as excinfo:
+        roster.resolve(name="GOAD")
+
+    reasons = dict(excinfo.value.matches)
+    assert set(reasons) == {"provider: GOAD-DC01", "provider: GOAD-DC02"}
+    assert all("a substring of" in why for why in reasons.values())
+    assert "matched a substring of 'provider: GOAD-DC01'" in str(excinfo.value)
+
+
+def test_unknown_uuid_message_reports_length_not_a_roster_dump(
+    loaded: roster.RosterSnapshot,
+) -> None:
+    """A truncated uuid needs its length reported, and needs to not be told to
+    "use a uuid" when it just supplied one.
+
+    Listing every registered VM here would be noise: the caller's problem is a
+    malformed identifier, not an unfamiliar name.
+    """
+    with pytest.raises(roster.UnknownVm) as excinfo:
+        roster.resolve(uuid="56 4d f4 8b")
+
+    message = str(excinfo.value)
+    assert "8 hex characters" in message
+    assert "a VM uuid is 32" in message
+    assert "use a uuid" not in message
+    assert "provider: GOAD-DC01" not in message
+
+
+def test_unknown_full_length_uuid_still_reports_its_length(
+    loaded: roster.RosterSnapshot,
+) -> None:
+    with pytest.raises(roster.UnknownVm) as excinfo:
+        roster.resolve(uuid="de ad be ef 00 00 00 00-00 00 00 00 00 00 00 ff")
+
+    assert "32 hex characters" in str(excinfo.value)
+
+
+def test_unknown_name_suggests_a_near_miss(loaded: roster.RosterSnapshot) -> None:
+    """A near-miss should be recoverable from the error alone.
+
+    `GOAD-DC09` matches no VM by any tier, but it is one character from two
+    real names, so the error should name them.
+    """
+    with pytest.raises(roster.UnknownVm) as excinfo:
+        roster.resolve(name="GOAD-DC09")
+
+    message = str(excinfo.value)
+    assert "Did you mean" in message
+    assert "provider: GOAD-DC01" in message
+    assert "provider: GOAD-DC02" in message
+
+
+def test_unknown_name_with_no_near_miss_still_lists_the_registry(
+    loaded: roster.RosterSnapshot,
+) -> None:
+    """Nothing is close to `no-such-vm`, so there is no suggestion to make and
+    the full list is the most useful thing left to say."""
+    with pytest.raises(roster.UnknownVm) as excinfo:
+        roster.resolve(name="no-such-vm")
+
+    message = str(excinfo.value)
+    assert "Did you mean" not in message
+    assert "Registered VMs:" in message
+    assert "provider: GOAD-DC01" in message
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        pytest.param("GOAD-DC09", id="has-a-near-miss"),
+        pytest.param("no-such-vm", id="has-no-near-miss"),
+    ],
+)
+def test_unknown_name_message_is_punctuated(
+    loaded: roster.RosterSnapshot, query: str
+) -> None:
+    """Guards the seam between the two branches.
+
+    The branches differ in what they end with -- a suggestion list ends in "?"
+    and the roster dump ends in "." -- and a single shared suffix previously ran
+    together with one of them, giving "Did you mean: X?. Registered VMs:" on one
+    path and "... PROVISIONING Use a uuid" on the other.
+    """
+    with pytest.raises(roster.UnknownVm) as excinfo:
+        roster.resolve(name=query)
+
+    message = str(excinfo.value)
+    assert "?." not in message, f"double punctuation: {message}"
+    assert " Use a uuid to refer to one unambiguously." in message
+    # The clause before the shared suffix must be properly terminated.
+    head, _, tail = message.rpartition(" Use a uuid")
+    assert head.endswith(("?", ".")), f"run-on sentence: {message}"
+    assert tail.startswith(" to refer to")
+
+
 def test_very_short_query_does_not_fuzzy_match(
     loaded: roster.RosterSnapshot,
 ) -> None:
@@ -417,19 +556,6 @@ def test_uuid_passed_as_name_still_resolves(
     """A caller who pastes a uuid into `name` should get the VM, not a
     'no such display name' error about a perfectly good uuid."""
     assert roster.resolve(name=VMS["dc01"][1]).normalized_uuid == normalize_uuid(VMS["dc01"][1])
-
-
-def test_unknown_name_error_lists_what_is_registered(
-    loaded: roster.RosterSnapshot,
-) -> None:
-    """An error that names the alternatives is the difference between one retry
-    and a dead end."""
-    with pytest.raises(roster.UnknownVm) as excinfo:
-        roster.resolve(name="no-such-vm")
-
-    message = str(excinfo.value)
-    assert "provider: GOAD-DC01" in message
-    assert "list_vms" in message
 
 
 def test_agreeing_uuid_and_name_are_accepted(

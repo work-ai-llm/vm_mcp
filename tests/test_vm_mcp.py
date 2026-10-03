@@ -360,8 +360,8 @@ def test_vm_status_reads_cpu_and_memory_from_the_vmx(lab, vmrun) -> None:
         pytest.param("win9x", "windows", id="win9x"),
         pytest.param("ubuntu-64", "linux", id="ubuntu"),
         pytest.param("rhel8-64", "linux", id="rhel"),
-        pytest.param("otherlinux64", "other", id="vmware-cannot-classify"),
-        pytest.param("other", "other", id="vmware-cannot-classify-bare"),
+        pytest.param("otherlinux64", "linux", id="otherlinux-is-linux"),
+        pytest.param("other", "other", id="genuinely-unclassified"),
         pytest.param("darwin-64", "macos", id="darwin-contains-win"),
         pytest.param("solaris-64", "solaris", id="solaris"),
         pytest.param("mystery-os", "unknown", id="unrecognised"),
@@ -374,13 +374,26 @@ def test_os_family_decodes_the_vendor_vocabulary(guestos: str, expected: str) ->
     `windows9srv-64` means Server 2019 -- and a wrong guess there is worse than
     an honest `unknown`.
 
-    The two adversarial cases are the point. `darwin-64` contains the substring
-    "win" and `otherlinux-64` contains "linux", so matching by substring reports
-    a macOS guest as Windows and VMware's own "cannot classify this" marker as
-    Linux. `other` is also kept distinct from `unknown`: the first is VMware
-    declining to classify, the second is us failing to read the field.
+    Two cases carry the weight. `darwin-64` contains the substring "win", so
+    matching by substring would report a macOS guest as Windows; hence prefixes.
+    And `otherlinux-64` is mapped to `linux` despite meaning "Linux, distro
+    unclassified" -- reporting it as `other` would make an agent enumerating
+    Linux hosts skip the wazuh manager, which is Linux. The unclassified-distro
+    detail is still in `guest_os`. `unknown` stays reserved for a field we could
+    not read or interpret.
     """
     assert server.os_family(guestos) == expected
+
+
+def test_otherlinux_guests_are_still_linux_in_a_live_status(lab, vmrun) -> None:
+    """The host's wazuh manager is `otherlinux-64`. The regression this pins is
+    an agent asking "which Linux hosts exist?" and getting 2 of 3."""
+    vmrun()
+
+    result = call(server.vm_status, uuid=WAZUH_UUID)
+
+    assert result["guest_os"] == "otherlinux-64"
+    assert result["os_family"] == "linux"
 
 
 def test_vm_status_reports_os_family_beside_the_raw_value(lab, vmrun) -> None:

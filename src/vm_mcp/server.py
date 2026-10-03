@@ -130,9 +130,6 @@ def _norm_path(path: str) -> str:
 # come first.
 _OS_FAMILIES: tuple[tuple[str, str], ...] = (
     ("darwin", "macos"),
-    # VMware's catch-all. Must precede "linux", which it contains.
-    ("otherlinux", "other"),
-    ("other", "other"),
     ("windows", "windows"),
     ("win", "windows"),
     ("msdos", "dos"),
@@ -148,6 +145,12 @@ _OS_FAMILIES: tuple[tuple[str, str], ...] = (
     ("fedora", "linux"),
     ("sles", "linux"),
     ("linux", "linux"),
+    # VMware's catch-all, reached only after every specific Linux marker. It
+    # means "Linux, distro unclassified" and is reported as `linux`: an agent
+    # asking "which Linux hosts can I start?" must not silently lose a VM to it.
+    # The host's wazuh manager is `otherlinux-64` and is Linux.
+    ("otherlinux", "linux"),
+    ("other", "other"),
 )
 
 
@@ -159,10 +162,18 @@ def os_family(guestos: str) -> str:
 
     Returns:
         One of `windows`, `linux`, `bsd`, `solaris`, `macos`, `dos`, `other`, or
-        `unknown`. `other` is not a failure: VMware uses `otherlinux-64` for
-        guests it cannot classify, and reporting that as "linux" would overstate
-        what we know. `unknown` means the value matched no known identifier at
-        all.
+        `unknown`.
+
+    `otherlinux-64` maps to `linux`, not `other`. It does mean "Linux, distro
+    unclassified", and it is tempting to report that as its own thing to avoid
+    overstating what we know. The practical cost is worse: an agent enumerating
+    Linux hosts would skip the VM entirely, and would be wrong about the lab.
+    The unclassified-distro detail is still visible in `guest_os`, so nothing is
+    actually lost by answering `linux` here.
+
+    `unknown` is reserved for a value matching no known identifier at all, which
+    means we could not read or interpret the field -- not that VMware declined
+    to classify the guest.
     """
     folded = guestos.strip().casefold()
     for prefix, family in _OS_FAMILIES:
@@ -319,9 +330,10 @@ async def vm_status(uuid: str | None = None, name: str | None = None) -> dict[st
               the registry's own copy of this is unreliable.
           os_family: Coarse family for `guest_os` -- `windows`, `linux`, `bsd`,
               `solaris`, `macos`, `dos`, `other`, or `unknown`. Present so you can
-              ask "is this Windows?" without knowing VMware's vocabulary. `other`
-              means VMware could not classify the guest, which is not the same
-              as `unknown`, which means we could not read the field.
+              ask "is this Windows?" without knowing VMware's vocabulary.
+              `otherlinux-64` reports as `linux`, so a Linux enumeration does not
+              silently skip it; `unknown` means the field could not be read or
+              interpreted, which is not the same as `other`.
           tools_state: VMware Tools state. `running` when the guest agent is
               active, `installed` when present but the VM is off. Says nothing
               about a powered-off guest, so it is reported as undetermined

@@ -74,6 +74,7 @@ changes on a Vagrant rebuild and means nothing outside that folder.
 
 from __future__ import annotations
 
+import difflib
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -124,44 +125,97 @@ class RosterError(Exception):
 class UnknownVm(RosterError):
     """No registered VM matches the supplied identifier.
 
-    The message lists what *is* available. A bare "no registered VM named X"
-    leaves an agent with nowhere to go: it has to guess another spelling, and a
-    wrong guess looks exactly like a missing VM. An error that names the
-    alternatives is the difference between one retry and a dead end.
+    The message is tailored to which kind of identifier failed. A name that
+    matched nothing gets near-miss suggestions, because the caller's problem is
+    a spelling. A UUID that matched nothing gets told its length and pointed at
+    `list_vms`, because the caller's problem is that they pasted a fragment --
+    and telling a caller who just supplied a uuid to "use a uuid" is absurd.
     """
 
-    def __init__(self, query: str, candidates: Sequence[str]) -> None:
+    def __init__(
+        self,
+        query: str,
+        candidates: Sequence[str],
+        *,
+        as_uuid: bool = False,
+        uuid_text: str = "",
+        name_text: str = "",
+    ) -> None:
         self.query = query
         self.candidates = list(candidates)
+
         # `query` already carries its own quoting (e.g. `name 'GOAD-DC0'`), so it
         # is interpolated rather than repr'd -- otherwise the message reads
         # `no registered VM matches "name 'GOAD-DC0'"`.
         message = f"no registered VM matches {query}"
+
+        if as_uuid:
+            # Length is the actionable fact. A VMware UUID is 16 bytes rendered as
+            # 32 hex digits, with the registry's own spacing varying; anything
+            # shorter is a truncated paste or a typo, and saying so saves the
+            # caller from re-reading the whole roster looking for a near miss.
+            digits = len(normalize_uuid(uuid_text))
+            message += (
+                f". That is {digits} hex characters; a VM uuid is 32. "
+                "Call list_vms for the registered uuids."
+            )
+            super().__init__(message)
+            return
+
         if not candidates:
             message += ". No VMs are registered for this user."
         else:
-            listed = ", ".join(candidates)
-            if len(candidates) > _MAX_SUGGESTIONS:
-                listed += f", ... ({len(candidates)} total)"
-            message += f". Registered VMs: {listed}"
-            message += ". Call list_vms for the full list, or use a uuid."
+            close = difflib.get_close_matches(
+                name_text.strip().casefold(),
+                [c.casefold() for c in candidates],
+                n=_MAX_SUGGESTIONS,
+                cutoff=0.5,
+            )
+            if close:
+                # Close matches are the answer. Appending the full roster on top
+                # is noise, and produced "Did you mean: X?. Registered VMs: ..."
+                by_folded = {c.casefold(): c for c in candidates}
+                message += ". Did you mean: " + ", ".join(
+                    by_folded[c] for c in close
+                ) + "?"
+            else:
+                listed = ", ".join(candidates)
+                if len(candidates) > _MAX_SUGGESTIONS:
+                    listed += f", ... ({len(candidates)} total)"
+                message += f". Registered VMs: {listed}."
+            # Both branches above end in sentence-final punctuation, so this reads
+            # correctly either way.
+            message += " Use a uuid to refer to one unambiguously."
         super().__init__(message)
 
 
 class AmbiguousName(RosterError):
     """A name matches more than one registered VM.
 
-    Carries the candidates so the caller can report them instead of silently
-    picking one. An agent asked about "Windows 10" when two VMs are called
-    "Windows 10" must not receive a confident answer about the wrong one.
+    Carries the candidates, each with the alias that matched it. The reason
+    matters: asked for `ubuntu`, the caller is confused why `provider:
+    PROVISIONING` is in the list, and the answer is that its `.vmx` is called
+    `ubuntu-22.04-amd64.vmx`. A list of bare names gives the caller no way to
+    work that out, so they either pick wrongly or give up.
     """
 
-    def __init__(self, name: str, candidates: list[str]) -> None:
+    def __init__(self, name: str, matches: Sequence[tuple[str, str]]) -> None:
         self.name = name
-        self.candidates = candidates
-        joined = ", ".join(candidates)
+        # Kept as plain names for callers that just want the list; the reason is
+        # available separately and is what the message renders.
+        self.candidates = [vm_name for vm_name, _ in matches]
+        self.matches = list(matches)
+
+        if all(reason == "its display name" for _, reason in matches):
+            detail = ""
+        else:
+            rendered = "; ".join(
+                f"{vm_name} (matched {reason})" for vm_name, reason in matches
+            )
+            detail = f": {rendered}"
+
         super().__init__(
-            f"display name {name!r} matches {len(candidates)} VMs: {joined}. "
+            f"display name {name!r} matches {len(matches)} VMs{detail}. "
             "Identify the VM by uuid instead."
         )
 
@@ -464,15 +518,28 @@ def resolve(
     if by_name:
         return by_name
 
-    # Nothing matched. Name the alternatives so the caller can retry.
-    if uuid_query and name_query:
-        query = f"uuid {uuid_query!r} or name {name_query!r}"
-    elif uuid_query:
-        query = f"uuid {uuid_query!r}"
-    else:
-        query = f"name {name_query!r}" if name_query else "an empty identifier"
+    # Nothing matched. Tailor the message to what was actually supplied.
+    # A uuid that matched nothing is a truncated paste or a typo, and the useful
+    # fact is its length -- listing every registered VM would be noise, and
+    # telling the caller to "use a uuid" when they just did is worse.
+    names = [vm.name for vm in snapshot.vms]
 
-    raise UnknownVm(query, [vm.name for vm in snapshot.vms])
+    if uuid_query and not name_query:
+        raise UnknownVm(
+            f"uuid {uuid_query!r}", names, as_uuid=True, uuid_text=uuid_query
+        )
+
+    if uuid_query and name_query:
+        raise UnknownVm(
+            f"uuid {uuid_query!r} or name {name_query!r}",
+            names,
+            name_text=name_query,
+        )
+
+    if name_query:
+        raise UnknownVm(f"name {name_query!r}", names, name_text=name_query)
+
+    raise UnknownVm("an empty identifier", names)
 
 
 def _find_by_uuid(
@@ -487,6 +554,26 @@ def _find_by_uuid(
     for vm in snapshot.vms:
         if vm.normalized_uuid == target:
             return vm
+    return None
+
+
+def _matching_alias(vm: RegisteredVm, needle: str) -> tuple[str, str] | None:
+    """If `needle` matches one of `vm`'s aliases, return (alias, human reason).
+
+    The reason is what makes an ambiguity message debuggable instead of just
+    noisy: it distinguishes "its display name is this" from "its `.vmx` file is
+    called that", which are entirely different things to have collided.
+    """
+    folded = needle.casefold()
+    for alias in vm.aliases:
+        if alias.casefold() != folded:
+            continue
+        if alias == vm.name:
+            return alias, "its display name"
+        if alias == vm.vmx_stem:
+            return alias, f"its .vmx filename {alias!r}"
+        # The only remaining alias shape is the prefix-stripped name.
+        return alias, f"its display name without the {_PREFIX_RE.match(vm.name).group(0).strip()!r} prefix"
     return None
 
 
@@ -505,6 +592,10 @@ def _find_by_name(
     3. A unique substring. "DC01" and "wazuh" work. Guarded by a minimum length
        so "01" does not match most of the lab, and by requiring uniqueness so
        "goad" does not silently pick one of seven.
+
+    Raises:
+        AmbiguousName: More than one VM matched, carrying the alias each matched
+            on so the caller can see why.
     """
     needle = query.strip()
     if not needle:
@@ -518,26 +609,32 @@ def _find_by_name(
     if len(exact) == 1:
         return exact[0]
     if len(exact) > 1:
-        raise AmbiguousName(needle, [vm.name for vm in exact])
+        raise AmbiguousName(needle, [(vm.name, "its display name") for vm in exact])
 
     folded = needle.casefold()
-    aliased = [
-        vm
-        for vm in snapshot.vms
-        if any(a.casefold() == folded for a in vm.aliases)
-    ]
+
+    aliased: list[tuple[RegisteredVm, str, str]] = []
+    for vm in snapshot.vms:
+        hit = _matching_alias(vm, needle)
+        if hit:
+            aliased.append((vm, hit[0], hit[1]))
     if len(aliased) == 1:
-        return aliased[0]
+        return aliased[0][0]
     if len(aliased) > 1:
-        raise AmbiguousName(needle, [vm.name for vm in aliased])
+        raise AmbiguousName(needle, [(vm.name, why) for vm, _, why in aliased])
 
     if len(folded) < _MIN_SUBSTRING:
         return None
 
-    partial = [vm for vm in snapshot.vms if any(folded in a.casefold() for a in vm.aliases)]
+    partial: list[tuple[RegisteredVm, str, str]] = []
+    for vm in snapshot.vms:
+        for alias in vm.aliases:
+            if folded in alias.casefold():
+                partial.append((vm, alias, f"a substring of {alias!r}"))
+                break
     if len(partial) == 1:
-        return partial[0]
+        return partial[0][0]
     if len(partial) > 1:
-        raise AmbiguousName(needle, [vm.name for vm in partial])
+        raise AmbiguousName(needle, [(vm.name, why) for vm, _, why in partial])
 
     return None

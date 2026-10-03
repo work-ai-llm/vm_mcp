@@ -135,7 +135,6 @@ def lab(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     )
 
     monkeypatch.setattr(roster, "inventory_path", lambda: registry_file)
-    monkeypatch.setattr(roster, "_cache", None, raising=False)
 
     return {
         "registry": registry_file,
@@ -225,7 +224,62 @@ def test_list_vms_carries_no_configuration_fields(lab, vmrun) -> None:
     vmrun()
     entry = call(server.list_vms)["vms"][0]
 
-    assert set(entry) == {"name", "uuid", "vmx", "power_state"}
+    assert set(entry) == {"name", "uuid", "power_state"}
+
+
+def test_list_vms_omits_the_vmx_path(lab, vmrun) -> None:
+    """No path in the list.
+
+    A caller cannot act on a path -- vm_status resolves against the registry, not
+    a file -- and the Vagrant paths run about 190 characters each. Across eight
+    VMs that is most of the payload for information nothing can use. vm_status
+    still returns it, where it is worth the characters.
+    """
+    vmrun()
+    result = call(server.list_vms)
+
+    assert all("vmx" not in vm for vm in result["vms"])
+    assert "vmx" in call(server.vm_status, name="provider: GOAD-DC01")
+
+
+def test_list_vms_and_vm_status_see_the_same_registry(lab, vmrun) -> None:
+    """The two tools must never disagree about which VMs exist.
+
+    list_vms used to re-read the registry while vm_status used a cached
+    snapshot, so a VM registered after startup appeared in the list and was then
+    reported as unknown by name. Same server, same instant, two different
+    answers.
+    """
+    vmrun()
+    listed = {vm["uuid"] for vm in call(server.list_vms)["vms"]}
+
+    for name in ("provider: GOAD-DC01", "wazuh-4.7.5"):
+        assert call(server.vm_status, name=name)["uuid"] in listed
+
+
+def test_vm_registered_after_startup_is_visible_to_both_tools(
+    lab, vmrun, tmp_path
+) -> None:
+    """A VM added to the registry while the server is already running resolves
+    on the next call, with no refresh step in between.
+
+    This is the bug that made the tools order-dependent: `list_vms` re-read the
+    registry and `vm_status` read a cached snapshot, so a newly registered VM
+    was listed and then reported as unknown by name.
+    """
+    vmrun()
+    lab["registry"].write_bytes(
+        lab["registry"].read_bytes()
+        + f'\r\nvmlist3.config = "{RUNNING_VMX}"\r\n'
+        'vmlist3.DisplayName = "LateVM"\r\n'
+        'vmlist3.UUID = "ff 00 00 00 00 00 00 00-00 00 00 00 00 00 00 09"\r\n'.encode(
+            "windows-1251"
+        )
+    )
+
+    listed = {vm["name"] for vm in call(server.list_vms)["vms"]}
+    assert "LateVM" in listed
+    assert call(server.vm_status, name="LateVM")["name"] == "LateVM"
 
 
 def test_list_vms_marks_only_listed_vms_running(lab, vmrun) -> None:
@@ -274,7 +328,7 @@ def test_unreadable_registry_is_reported_as_an_error(lab, vmrun, monkeypatch) ->
     vmrun call with nothing to look up."""
     fake = vmrun()
     monkeypatch.setattr(
-        roster, "refresh", lambda *a, **k: roster.RosterSnapshot((), "registry gone")
+        roster, "registry", lambda *a, **k: roster.RosterSnapshot((), "registry gone")
     )
 
     result = call(server.list_vms)
@@ -298,18 +352,76 @@ def test_vm_status_reads_cpu_and_memory_from_the_vmx(lab, vmrun) -> None:
     assert result["guest_os"] == "windows9srv-64"
 
 
-def test_vmx_keys_are_matched_case_insensitively(lab, vmrun) -> None:
-    """Live files use `displayname` and `displayName` interchangeably. A
-    case-sensitive read returns nothing for half the lab, which is
-    indistinguishable from "this VM has no name"."""
+@pytest.mark.parametrize(
+    ("guestos", "expected"),
+    [
+        pytest.param("windows9srv-64", "windows", id="server-2019"),
+        pytest.param("windows9srv", "windows", id="server-32-bit"),
+        pytest.param("win9x", "windows", id="win9x"),
+        pytest.param("ubuntu-64", "linux", id="ubuntu"),
+        pytest.param("rhel8-64", "linux", id="rhel"),
+        pytest.param("otherlinux64", "other", id="vmware-cannot-classify"),
+        pytest.param("other", "other", id="vmware-cannot-classify-bare"),
+        pytest.param("darwin-64", "macos", id="darwin-contains-win"),
+        pytest.param("solaris-64", "solaris", id="solaris"),
+        pytest.param("mystery-os", "unknown", id="unrecognised"),
+    ],
+)
+def test_os_family_decodes_the_vendor_vocabulary(guestos: str, expected: str) -> None:
+    """`guestos` values are VMware identifiers, not OS names.
+
+    An agent asked "is this VM Windows?" would otherwise need to know that
+    `windows9srv-64` means Server 2019 -- and a wrong guess there is worse than
+    an honest `unknown`.
+
+    The two adversarial cases are the point. `darwin-64` contains the substring
+    "win" and `otherlinux-64` contains "linux", so matching by substring reports
+    a macOS guest as Windows and VMware's own "cannot classify this" marker as
+    Linux. `other` is also kept distinct from `unknown`: the first is VMware
+    declining to classify, the second is us failing to read the field.
+    """
+    assert server.os_family(guestos) == expected
+
+
+def test_vm_status_reports_os_family_beside_the_raw_value(lab, vmrun) -> None:
+    """Both, because the raw value is the ground truth and the family is the
+    convenience."""
     vmrun()
 
-    assert call(server.vm_status, uuid=DC01_UUID)["display_name"] == (
-        "provider: GOAD-DC01"
-    )
-    assert call(server.vm_status, uuid=WAZUH_UUID)["display_name"] == (
-        "wazuh-4.7.5"
-    )
+    result = call(server.vm_status, uuid=DC01_UUID)
+
+    assert result["guest_os"] == "windows9srv-64"
+    assert result["os_family"] == "windows"
+
+
+def test_vm_status_does_not_repeat_the_display_name(lab, vmrun) -> None:
+    """`name` already carries it.
+
+    The registry display name and the `.vmx` `displayname` are identical on
+    every VM checked, so the second copy is pure payload. Kept only if VMware
+    ever makes them diverge, which it has not.
+    """
+    vmrun()
+
+    result = call(server.vm_status, uuid=DC01_UUID)
+
+    assert result["name"] == "provider: GOAD-DC01"
+    assert "display_name" not in result
+
+
+def test_vmx_keys_are_matched_case_insensitively(lab, vmrun, monkeypatch) -> None:
+    """Live files use `displayname` and `displayName` interchangeably, and the
+    lab has both spellings. A case-sensitive read returns nothing for half of
+    it.
+
+    Exercised through `guestos`, which is present in both files, rather than
+    through `displayname`, which `vm_status` no longer returns.
+    """
+    vmrun()
+    monkeypatch.setattr(server, "os_family", lambda _: "SENTINEL")
+
+    assert call(server.vm_status, uuid=DC01_UUID)["os_family"] == "SENTINEL"
+    assert call(server.vm_status, uuid=WAZUH_UUID)["os_family"] == "SENTINEL"
 
 
 def test_vm_status_falls_back_to_name(lab, vmrun) -> None:
@@ -357,6 +469,27 @@ def test_ambiguous_name_is_an_error_listing_candidates(lab, vmrun, tmp_path) -> 
     message = str(excinfo.value)
     assert "matches 2 VMs" in message, f"ambiguity must be stated: {message}"
     assert "uuid" in message.lower(), "the message must say how to disambiguate"
+
+
+def test_contradictory_identifiers_explain_the_conflict(lab, vmrun) -> None:
+    """Both identifiers supplied and disagreeing must say so, not resolve one.
+
+    Also the regression guard for the shadowed `RosterError`: `IdentifierMismatch`
+    stopped being catchable as `roster.RosterError`, so this used to escape the
+    handler and reach the caller as a generic framework error with the
+    explanation lost.
+    """
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    fake = vmrun()
+
+    with pytest.raises(ToolError) as excinfo:
+        call(server.vm_status, uuid=DC01_UUID, name="wazuh-4.7.5")
+
+    message = str(excinfo.value)
+    assert "provider: GOAD-DC01" in message
+    assert "wazuh-4.7.5" in message
+    assert fake.calls == [], "no VMware call may happen on an unresolved identifier"
 
 
 def test_unresolvable_call_comes_back_as_is_error(lab, vmrun) -> None:

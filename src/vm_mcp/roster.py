@@ -44,9 +44,24 @@ are conservative:
 
 * UUID first, exact after normalization. It is the only unambiguous key: it is
   written into the `.vmx` at VM creation and survives a display-name rename.
-* Display name only as a convenience fallback, and an ambiguous name is an
-  error listing candidates rather than a guess.
-* The registry is read once and cached. See `refresh()`.
+  Never falls back to name matching, so a mistyped UUID is an error rather than
+  a report about the wrong machine.
+* Names are matched loosely, because refusing a correct-but-differently-spelled
+  name makes a tool unusable rather than safe. Three tiers, each looser than
+  the last, stopping at the first that matches: the exact registry name; any
+  accepted alias (prefix-stripped, or the `.vmx` filename stem), case-folded;
+  then a unique substring. An ambiguous match is an error listing candidates,
+  never a guess.
+* A UUID passed in the `name` argument is still recognized as a UUID. A caller
+  who pastes a uuid into the wrong argument should get the right VM.
+* Supplying a uuid and a name that disagree is an error. Quietly preferring one
+  discards half the caller's intent.
+* Failures list what *is* registered. An error that names the alternatives is
+  the difference between one retry and a dead end.
+
+Freshness: the registry is re-read on every call. It is a 7 KB file and reads in
+under a millisecond; caching it bought nothing and made `list_vms` and
+`vm_status` able to disagree about which VMs exist.
 
 The UUID comparison normalizes away case and separators because the registry
 writes `56 4d f4 8b bf be 94 a5-...` while a caller may pass the dashed form.
@@ -60,6 +75,7 @@ changes on a Vagrant rebuild and means nothing outside that folder.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -71,12 +87,29 @@ __all__ = [
     "RosterError",
     "AmbiguousName",
     "UnknownVm",
+    "IdentifierMismatch",
     "inventory_path",
     "parse_inventory",
     "load_roster",
-    "refresh",
+    "registry",
     "resolve",
 ]
+
+
+# Vagrant writes display names as "provider: GOAD-DC01". A human reading about
+# the lab writes "GOAD-DC01", and an agent that read a document mentioning
+# GOAD-DC01 will pass that. Requiring the exact registry spelling makes the tool
+# fail on correct input, which is the worst failure mode there is: the caller
+# has done everything right and still gets told no.
+_PREFIX_RE = re.compile(r"^[A-Za-z][\w-]*:\s*")
+
+# A name query shorter than this is not used for substring matching, because
+# "01" is a substring of half the lab.
+_MIN_SUBSTRING = 3
+
+# Enough alternatives to name in an error: enough to be actionable, few enough
+# that the message stays readable on a host with twenty VMs.
+_MAX_SUGGESTIONS = 12
 
 
 class RosterError(Exception):
@@ -89,11 +122,34 @@ class RosterError(Exception):
 
 
 class UnknownVm(RosterError):
-    """No registered VM matches the supplied identifier."""
+    """No registered VM matches the supplied identifier.
+
+    The message lists what *is* available. A bare "no registered VM named X"
+    leaves an agent with nowhere to go: it has to guess another spelling, and a
+    wrong guess looks exactly like a missing VM. An error that names the
+    alternatives is the difference between one retry and a dead end.
+    """
+
+    def __init__(self, query: str, candidates: Sequence[str]) -> None:
+        self.query = query
+        self.candidates = list(candidates)
+        # `query` already carries its own quoting (e.g. `name 'GOAD-DC0'`), so it
+        # is interpolated rather than repr'd -- otherwise the message reads
+        # `no registered VM matches "name 'GOAD-DC0'"`.
+        message = f"no registered VM matches {query}"
+        if not candidates:
+            message += ". No VMs are registered for this user."
+        else:
+            listed = ", ".join(candidates)
+            if len(candidates) > _MAX_SUGGESTIONS:
+                listed += f", ... ({len(candidates)} total)"
+            message += f". Registered VMs: {listed}"
+            message += ". Call list_vms for the full list, or use a uuid."
+        super().__init__(message)
 
 
 class AmbiguousName(RosterError):
-    """A display name matches more than one registered VM.
+    """A name matches more than one registered VM.
 
     Carries the candidates so the caller can report them instead of silently
     picking one. An agent asked about "Windows 10" when two VMs are called
@@ -108,6 +164,16 @@ class AmbiguousName(RosterError):
             f"display name {name!r} matches {len(candidates)} VMs: {joined}. "
             "Identify the VM by uuid instead."
         )
+
+
+class IdentifierMismatch(RosterError):
+    """uuid and name were both given and they point at different VMs.
+
+    Silently preferring one would discard half the caller's intent. For a
+    function whose job is to be the trust boundary before any mutating tool, a
+    caller who names one VM by uuid and a different one by name has made a
+    mistake worth surfacing rather than resolving.
+    """
 
 
 @dataclass(frozen=True)
@@ -129,6 +195,41 @@ class RegisteredVm:
     @property
     def normalized_uuid(self) -> str:
         return normalize_uuid(self.uuid)
+
+    @property
+    def vmx_stem(self) -> str:
+        """The `.vmx` filename without its extension, e.g. `WindowsServer2019`.
+
+        Usually a different label from the display name, and often the one the
+        user recognizes: the display name is set by whatever created the VM,
+        while the filename is what shows up in Explorer.
+        """
+        return Path(self.vmx).stem
+
+    @property
+    def aliases(self) -> tuple[str, ...]:
+        """Every spelling this VM answers to, most authoritative first.
+
+        Includes the prefix-stripped name so `GOAD-DC01` resolves the VM the
+        registry calls `provider: GOAD-DC01`, and the `.vmx` stem so
+        `WindowsServer2019` resolves too. Comparison against these is
+        case-insensitive; the registry's own casing is what gets reported back.
+        """
+        candidates = [self.name]
+
+        stripped = _PREFIX_RE.sub("", self.name).strip()
+        if stripped and stripped != self.name:
+            candidates.append(stripped)
+
+        stem = self.vmx_stem.strip()
+        if stem:
+            candidates.append(stem)
+
+        seen: list[str] = []
+        for value in candidates:
+            if value and value.casefold() not in {v.casefold() for v in seen}:
+                seen.append(value)
+        return tuple(seen)
 
 
 @dataclass(frozen=True)
@@ -279,27 +380,21 @@ def load_roster(path: Path | None = None) -> RosterSnapshot:
     return parse_inventory(raw)
 
 
-_cache: RosterSnapshot | None = None
+def registry(path: Path | None = None) -> RosterSnapshot:
+    """Read the registry. Called on every tool invocation, never cached.
 
+    Caching was tried and removed. The file is ~7 KB and parses in well under a
+    millisecond, so the cache saved nothing measurable while creating a failure
+    mode that is genuinely hard to diagnose: register a new VM, `list_vms`
+    shows it, and `vm_status` on that same VM fails, because the two tools were
+    reading different snapshots. Order-dependent behaviour nobody can see is
+    worse than a redundant read, and there was no refresh tool to paper over
+    it.
 
-def refresh(path: Path | None = None) -> RosterSnapshot:
-    """Read the registry and replace the cached snapshot.
-
-    Read once at startup and cached, deliberately. A long-lived HTTP server
-    would otherwise either hold a stale answer indefinitely or re-read the file
-    on every call and pay for it. Explicit `refresh()` is the escape hatch for
-    the case where someone registers a new VM and wants the server to notice.
+    `main()` still reads at startup, so a broken registry is reported when the
+    server boots instead of on the first tool call.
     """
-    global _cache
-    _cache = load_roster(path)
-    return _cache
-
-
-def _snapshot() -> RosterSnapshot:
-    global _cache
-    if _cache is None:
-        _cache = load_roster()
-    return _cache
+    return load_roster(path)
 
 
 def resolve(
@@ -310,72 +405,139 @@ def resolve(
 ) -> RegisteredVm:
     """Map a caller-supplied identifier to exactly one registered VM.
 
+    Names are matched loosely on purpose. A caller who writes "GOAD-DC01" has
+    named the VM correctly even though the registry calls it "provider:
+    GOAD-DC01", and refusing correct input because of a prefix is the kind of
+    failure that makes a tool unusable. A UUID is matched exactly and only
+    after normalizing case and separators.
+
     Args:
-        identifier: Either a UUID or a display name. Tried as UUID first, then
-            as a name.
-        uuid: Explicit UUID form of the same thing, takes precedence over
-            `name`.
-        name: Explicit display-name form.
+        identifier: Either a UUID or a name, matched as whichever it looks
+            like.
+        uuid: Explicit UUID form. Takes precedence over `name`, but if `name`
+            also matches a *different* VM that is an error rather than a
+            silent choice.
+        name: Explicit name form. A UUID passed here is still recognized as a
+            UUID, because a caller who pastes a uuid into the wrong argument
+            should get the right VM, not a confusing "no such name".
 
     Returns:
         The single matching RegisteredVm.
 
     Raises:
         UnknownVm: Nothing matched, or the registry is unusable.
-        AmbiguousName: A display name matched more than one VM.
+        AmbiguousName: A name matched more than one VM.
+        IdentifierMismatch: uuid and name were both given and disagree.
     """
-    roster = _snapshot()
-    if not roster.ok:
-        raise RosterError(roster.error or "registry unavailable")
+    snapshot = registry()
+    if not snapshot.ok:
+        raise RosterError(snapshot.error or "registry unavailable")
 
     explicit_uuid = uuid
     explicit_name = name
+    bare = identifier if explicit_uuid is None and explicit_name is None else None
 
-    # A bare `identifier` is tried as a UUID and then as a name, so it has to be
-    # classified rather than assumed.
-    wanted_uuid = explicit_uuid or identifier
-    wanted_name = explicit_name or (
-        identifier if explicit_uuid is None and explicit_name is None else None
-    )
+    # Classify each supplied value by shape rather than by which argument it
+    # arrived in, so a uuid pasted into `name` still resolves as a uuid.
+    uuid_query = explicit_uuid or (bare if _is_uuid_shaped(bare or "") else None)
+    name_query = explicit_name or bare
+    if name_query and _is_uuid_shaped(name_query):
+        uuid_query = uuid_query or name_query
+        name_query = None
 
-    # Only treat something as a UUID if it is actually UUID-shaped. Stripping
-    # non-hex characters is not enough: "provider: GOAD-DC01" reduces to
-    # "deadc01", which is non-empty and would send a display name down the UUID
-    # path and fail it there.
-    if wanted_uuid and _is_uuid_shaped(wanted_uuid):
-        target = normalize_uuid(wanted_uuid)
-        for vm in roster.vms:
-            if vm.normalized_uuid == target:
-                return vm
-        # A UUID-shaped identifier that matched nothing is an error rather than
-        # a fallback to name matching. A caller who mistyped one character gets
-        # told, instead of silently receiving a report about a different VM.
-        raise UnknownVm(f"no registered VM with uuid {wanted_uuid!r}")
+    by_uuid = _find_by_uuid(snapshot, uuid_query) if uuid_query else None
+    by_name = _find_by_name(snapshot, name_query) if name_query else None
 
-    if explicit_uuid is not None:
-        # Explicitly asked for by UUID but the value is not a UUID at all.
-        raise UnknownVm(f"{explicit_uuid!r} is not a VM UUID")
+    # Both supplied and pointing at different VMs is a caller mistake worth
+    # surfacing. Quietly preferring the uuid would discard the name entirely,
+    # and this function is the trust boundary every mutating tool will sit
+    # behind.
+    if by_uuid and by_name and by_uuid.uuid != by_name.uuid:
+        raise IdentifierMismatch(
+            f"uuid {uuid_query!r} is {by_uuid.name!r} but name "
+            f"{name_query!r} is {by_name.name!r}. Supply one identifier, not "
+            "two that disagree."
+        )
 
-    if not wanted_name:
-        raise UnknownVm("no VM identifier supplied")
+    if by_uuid:
+        return by_uuid
+    if by_name:
+        return by_name
 
-    needle = wanted_name.strip()
+    # Nothing matched. Name the alternatives so the caller can retry.
+    if uuid_query and name_query:
+        query = f"uuid {uuid_query!r} or name {name_query!r}"
+    elif uuid_query:
+        query = f"uuid {uuid_query!r}"
+    else:
+        query = f"name {name_query!r}" if name_query else "an empty identifier"
+
+    raise UnknownVm(query, [vm.name for vm in snapshot.vms])
+
+
+def _find_by_uuid(
+    snapshot: RosterSnapshot, query: str
+) -> RegisteredVm | None:
+    """Exact uuid match, or None. Never falls back to name matching.
+
+    A mistyped UUID reports an error rather than quietly resolving some other
+    VM, which for a future power-off tool would be catastrophic.
+    """
+    target = normalize_uuid(query)
+    for vm in snapshot.vms:
+        if vm.normalized_uuid == target:
+            return vm
+    return None
+
+
+def _find_by_name(
+    snapshot: RosterSnapshot, query: str
+) -> RegisteredVm | None:
+    """Match a name across the registry's spelling variants.
+
+    Three tiers, each strictly looser than the last, stopping at the first that
+    matches anything:
+
+    1. The registry's exact display name.
+    2. Any accepted alias, case-insensitively. This is what makes "GOAD-DC01"
+       resolve "provider: GOAD-DC01" and "WindowsServer2019" resolve a VM
+       named something else entirely.
+    3. A unique substring. "DC01" and "wazuh" work. Guarded by a minimum length
+       so "01" does not match most of the lab, and by requiring uniqueness so
+       "goad" does not silently pick one of seven.
+    """
+    needle = query.strip()
     if not needle:
-        raise UnknownVm("empty VM identifier")
+        return None
 
-    # Exact display-name match, then case-insensitive. Two tiers so a name that
-    # is unique up to case resolves without ambiguity.
-    exact = [vm for vm in roster.vms if vm.name == needle]
+    # Collect every tier-1 hit before returning any of them. Returning on the
+    # first would make two VMs sharing a display name resolve to whichever came
+    # first in the file, which is exactly the silent wrong answer this is
+    # supposed to prevent.
+    exact = [vm for vm in snapshot.vms if vm.name == needle]
     if len(exact) == 1:
         return exact[0]
-
-    folded = [vm for vm in roster.vms if vm.name.casefold() == needle.casefold()]
-    if len(folded) == 1:
-        return folded[0]
-    if len(folded) > 1:
-        raise AmbiguousName(needle, [vm.name for vm in folded])
-
-    if exact:
+    if len(exact) > 1:
         raise AmbiguousName(needle, [vm.name for vm in exact])
 
-    raise UnknownVm(f"no registered VM named {needle!r}")
+    folded = needle.casefold()
+    aliased = [
+        vm
+        for vm in snapshot.vms
+        if any(a.casefold() == folded for a in vm.aliases)
+    ]
+    if len(aliased) == 1:
+        return aliased[0]
+    if len(aliased) > 1:
+        raise AmbiguousName(needle, [vm.name for vm in aliased])
+
+    if len(folded) < _MIN_SUBSTRING:
+        return None
+
+    partial = [vm for vm in snapshot.vms if any(folded in a.casefold() for a in vm.aliases)]
+    if len(partial) == 1:
+        return partial[0]
+    if len(partial) > 1:
+        raise AmbiguousName(needle, [vm.name for vm in partial])
+
+    return None

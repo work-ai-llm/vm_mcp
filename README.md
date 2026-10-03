@@ -3,7 +3,7 @@
 An MCP server that lets an LLM agent inspect and control the local VMware Workstation
 GOAD lab: list the lab's VMs, power them on, off and back up, report how much host
 capacity is actually left, and determine whether a given guest is genuinely alive or
-merely powered on and frozen. The target is the six-machine AD lab on the author's own
+merely powered on and frozen. The target is the GOAD lab on the author's own
 workstation, driven by an agent that can be told things like "bring up the Essos domain
 controller and tell me when it's actually answering" without the agent needing to know
 anything about `.vmx` paths, `vmrun.exe` argument grammar, or what a half-booted
@@ -11,28 +11,17 @@ Windows domain controller looks like from the outside.
 
 ## Status
 
-**M0 foundation complete. The server runs and speaks MCP. It cannot touch a VM yet.**
+**M1 complete: two read-only tools, `list_vms` and `vm_status`. No mutating tool exists.**
 
-What exists and works: a stdio and an HTTP transport, a real tool round-trip
-(`ping`, `add`), and a test suite that spawns the server as a subprocess and
-speaks the protocol to it over its pipes with nothing mocked. Verified
-end to end: 14 tests pass, and opencode connects to the running server over
-HTTP and lists both tools.
+Every tool in this repository is read-only. None can change a VM's power
+state, and the test suite never touches VMware — 87 tests pass with no VMware
+process started. The mutating half is deliberately not written yet; the
+allowlist that has to gate it is [#15](https://github.com/work-ai-llm/vm_mcp/issues/15).
 
-The tools that do anything useful are not built. `ping` and `add` are
-plumbing proofs. No VMware instrument is invoked anywhere in the current code,
-so no VM can be affected by anything in this repository yet.
-
-The research that the design is based on — every control operation this server
-intends to wrap, executed against the real lab with timings recorded — lives in
-`PLAN.md` and `research/`, and is deliberately untracked.
-
-## Planned tool surface
-
-| Tool | Kind | Purpose |
+| Tool | Kind | Shipped |
 |---|---|---|
 | `list_vms` | read-only | The lab roster and each VM's power state. |
-| `vm_status` | read-only | Per-VM power state, configured vCPU/RAM, snapshots. |
+| `vm_status` | read-only | One VM's power state, vCPU, RAM, guest OS, VMware Tools state. |
 | `host_resources` | read-only | Measured host CPU, RAM and disk, plus per-VM RAM headroom. |
 | `guest_health` | read-only | Liveness ladder. Distinguishes `up` / `degraded` / `down` / `unknown` and reports how far up the ladder it got. |
 | `start_vm` | mutating | Power on, optionally waiting for the guest to become ready. |
@@ -43,6 +32,10 @@ The mutating tools are intended to ship disabled by default in client configurat
 gated behind an explicit per-agent opt-in. `guest_health` is the reason the project
 exists: it must separate "powered on" from "actually responsive", so a VM that is up
 but wedged reports as `degraded`, not `up`.
+
+The research that the design is based on — every control operation this server
+intends to wrap, executed against the real lab with timings recorded — lives in
+`PLAN.md` and `research/`, and is deliberately untracked.
 
 ## Design decisions
 
@@ -74,12 +67,28 @@ but wedged reports as `degraded`, not `up`.
    already broken by exactly this: it imports the removed `mcp.server.fastmcp` and pins
    no upper bound.) The SDK also no longer reads `.env` files.
 
-4. **VM names are resolved to `.vmx` paths through a closed allowlist; callers never
-   supply paths.** Exactly one function maps a VM name to a path, against a pinned
-   roster committed in the repository, with a `relative_to()` check against the lab root
-   as defence in depth. A tool that accepted a caller-supplied path would be an
-   arbitrary-file-primitive with a power switch on it. Paths are pinned, not discovered
-   by globbing — a glob would happily accept a path outside the lab.
+4. **Callers never supply paths. Names resolve through the live VMware registry.**
+   Exactly one function (`roster.resolve`) maps a caller-supplied identifier to a VM,
+   and it only ever returns a path that the registry itself lists. A tool accepting a
+   caller-supplied path would be an arbitrary-file-primitive with a power switch on it.
+   The registry is `%APPDATA%\VMware\inventory.vmls` — the same file the GUI reads to
+   build its library — so the roster is discovered rather than pinned in the repository.
+   Paths are still never globbed: a glob would happily accept a path outside the lab.
+
+   What the registry does *not* carry is a power state, so `vmrun` supplies that. One
+   `vmrun list` call serves the whole roster. If `vmrun` cannot be reached, power state
+   is `unknown` for every VM and never `stopped` — collapsing those two would report a
+   powered-on domain controller as off during a host fault.
+
+   The registry's free-text `guest` field is **not** read. It is wrong on 3 of the 8 VMs
+   on this host (three Server 2019 machines labelled "windows server 2016"), so only
+   machine-written identity fields are trusted; guest OS comes from the `.vmx`.
+
+   UUIDs are the one unambiguous key: the registry's `UUID` equals the `.vmx` `uuid.bios`
+   on all 8 VMs, and it survives a display-name rename. Names are matched loosely as a
+   convenience — `GOAD-DC01` resolves the VM the registry calls `provider: GOAD-DC01`,
+   because refusing correct input over a prefix makes a tool unusable rather than safe.
+   An ambiguous match is an error listing candidates, never a guess.
 
 ## Usage
 
@@ -95,7 +104,10 @@ Start the server yourself; opencode only connects.
 
 ```powershell
 # Terminal 1 — the server, running independently
-.venv\Scripts\python.exe -m vm_mcp.test_server --transport http
+.venv\Scripts\vm-mcp.exe --transport http
+
+# equivalently, without relying on the console script being installed:
+.venv\Scripts\python.exe -m vm_mcp --transport http
 
 # Terminal 2 — opencode, from this directory
 opencode
@@ -129,9 +141,7 @@ on the port, opencode reports `✗ failed` and offers no tools.
     "vmware": {
       "type": "local",
       "command": [
-        "D:\\llms\\models\\testing\\vm_mcp\\.venv\\Scripts\\python.exe",
-        "-u",
-        "-m", "vm_mcp.test_server"
+        "D:\\llms\\models\\testing\\vm_mcp\\.venv\\Scripts\\vm-mcp.exe"
       ],
       "cwd": "D:\\llms\\models\\testing\\vm_mcp",
       "enabled": true,
@@ -154,13 +164,13 @@ handshake, the server answers `tools/list` with a name, a description and a JSON
 per tool, and opencode puts those into the model's context as callable functions. The
 model picks from what was advertised; it is not guessing and nothing is hardcoded
 client-side. The SDK derives the schema from the Python signature and the docstring,
-which is why the docstrings on `ping` and `add` are written as tool documentation
-rather than as code comments.
+which is why the docstrings on `list_vms` and `vm_status` are written as tool
+documentation rather than as code comments.
 
 ### Transports and settings
 
 `--transport stdio` (the default), `--host`, `--port`, `--path`. Defaults come from
-module constants at the top of `src/vm_mcp/test_server.py` — `DEFAULT_HTTP_HOST`,
+module constants at the top of `src/vm_mcp/server.py` — `DEFAULT_HTTP_HOST`,
 `DEFAULT_HTTP_PORT`, `DEFAULT_HTTP_PATH` — and are printed on every HTTP start:
 
 ```
@@ -197,8 +207,6 @@ that switch lives:
 "tools": {
   "vmware_list_vms": true,
   "vmware_vm_status": true,
-  "vmware_host_resources": true,
-  "vmware_guest_health": true,
 
   "vmware_start_vm": false,
   "vmware_stop_vm": false,
@@ -208,8 +216,8 @@ that switch lives:
 
 Tool annotations are hints to the model about what a call does. They are **not** access
 control: nothing enforces them, they carry no authorisation, and a caller that ignores
-them gets the same response. The real controls are the closed allowlist that turns a VM
-name into a path, the no-shell subprocess layer, and this client-side gating.
+them gets the same response. The real controls are the registry-backed resolution that
+turns a VM name into a path, the no-shell subprocess layer, and this client-side gating.
 
 The plan is to reach the server from a second machine over Tailscale. That is a
 bind-address change (`--host 0.0.0.0`) plus an authentication story, not a redesign —
@@ -218,21 +226,28 @@ when they are needed, are environment variables and never belong in a committed 
 
 ## Lab
 
-Target: the GOAD (Get Off Attack Domain) lab at `D:\vms\work_AD`, running on **VMware
-Workstation 17.5.2**. Six VMs:
+Target: the GOAD (Get Off Attack Domain) lab on **VMware Workstation 17.5.2**. The live
+registry has **8 VMs**, not the 6 the original plan assumed — the wazuh monitor and the
+Ubuntu 22.04 image VM were already registered on this host:
 
-| VM | Role | Domain | vCPU | RAM |
+| Registry name | Role | vCPU | RAM | Guest OS |
 |---|---|---|---|---|
-| `GOAD-DC01` | domain controller | `sevenkingdoms.local` | 2 | 3000 MB |
-| `GOAD-DC02` | domain controller | `north.sevenkingdoms.local` | 2 | 3000 MB |
-| `GOAD-DC03` | domain controller | `essos.local` | 2 | 3000 MB |
-| `GOAD-SRV02` | server | `north.sevenkingdoms.local` | 2 | 6000 MB |
-| `GOAD-SRV03` | server | `essos.local` | 2 | 5000 MB |
-| `PROVISIONING` | Linux jumpbox / provisioner (Ubuntu 22.04) | — | 2 | 2000 MB |
+| `provider: GOAD-DC01` | domain controller, `sevenkingdoms.local` | 2 | 3000 MB | Windows Server 2019 |
+| `provider: GOAD-DC02` | domain controller, `north.sevenkingdoms.local` | 2 | 3000 MB | Windows Server 2019 |
+| `provider: GOAD-DC03` | domain controller, `essos.local` | 2 | 3000 MB | Windows Server 2019 |
+| `provider: GOAD-SRV02` | server, `north.sevenkingdoms.local` | 2 | 6000 MB | Windows Server 2019 |
+| `provider: GOAD-SRV03` | server, `essos.local` | 2 | 5000 MB | Windows Server 2019 |
+| `provider: PROVISIONING` | Linux jumpbox / provisioner (Ubuntu 22.04) | 2 | 2000 MB | Ubuntu 22.04 |
+| `wazuh-4.7.5` | Wazuh manager | 4 | 8192 MB | Linux (unclassified by VMware) |
+| `Ubuntu_20.04.4_VM_LinuxVMImages.COM` | stock Ubuntu image | 2 | 4096 MB | Ubuntu 20.04 |
 
-Two operational facts constrain the design and are worth knowing before reading any
-future code. The full lab asks for ~21.5 GB of RAM against ~32 GB of physical memory
-on a 4-core host, so all six VMs cannot be powered on at once — capacity reporting must
+Note the `provider: ` prefix: that is Vagrant's naming, not VMware's, and it is why
+`vm_status(name="GOAD-DC01")` has to work as well as the registry's own spelling. The
+Server 2019 labels come from each `.vmx`; the registry's own `guest` field claims 2016
+for three of them and is not read.
+
+The GOAD lab alone asks for ~21.5 GB of RAM against ~32 GB of physical memory on a
+4-core host, so all five lab VMs cannot be powered on at once — capacity reporting must
 be honest per-VM rather than assume the lab fits. And a guest takes roughly 156 seconds
 from power-on to a responsive SSH service, so a `start_vm` that returns in under two
 seconds describes a VM that is useless for another two and a half minutes. Both are

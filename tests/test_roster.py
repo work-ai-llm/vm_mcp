@@ -35,10 +35,14 @@ _NON_ASCII_NAME = f"VM-{CYRILLIC}"
 VMS = {
     "dc01": ("provider: GOAD-DC01", "56 4d f4 8b bf be 94 a5-f8 b5 17 60 df 89 9e 33"),
     "dc02": ("provider: GOAD-DC02", "56 4d 7e 53 a7 bf 0d 82-aa 77 02 ce 5a 87 ad bf"),
+    "wazuh": ("wazuh-4.7.5", "dd 00 00 00 00 00 00 00-00 00 00 00 00 00 00 04"),
     "dup_a": ("Windows 10", "aa 00 00 00 00 00 00 00-00 00 00 00 00 00 00 01"),
     "dup_b": ("Windows 10", "bb 00 00 00 00 00 00 00-00 00 00 00 00 00 00 02"),
     "cyr": (_NON_ASCII_NAME, "cc 00 00 00 00 00 00 00-00 00 00 00 00 00 00 03"),
 }
+
+# Registered after the server is already running, to prove there is no cache.
+NEW_UUID = "ee 00 00 00 00 00 00 00-00 00 00 00 00 00 00 05"
 
 GOAD_ROOT = r"D:\vms\work_AD\goad\workspace\560030-goad-vmware\provider\.vagrant\machines"
 
@@ -48,22 +52,43 @@ def vmx_path(key: str) -> str:
         return rf"{GOAD_ROOT}\GOAD-DC01\vmware_desktop\7119ad91-edde-47d2-8b3e-ab6a8243183d\WindowsServer2019.vmx"
     if key == "dc02":
         return rf"{GOAD_ROOT}\GOAD-DC02\vmware_desktop\16227c43-505c-4c33-aae8-1873fba30582\WindowsServer2019.vmx"
+    if key == "wazuh":
+        return rf"{GOAD_ROOT}\wazuh-4.7.5\vmware_desktop\a3f1c0de-1111-2222-3333-444455556666\wazuh-4.7.5.vmx"
     if key == "cyr":
         return f"C:\\VMs\\{CYRILLIC}\\{_NON_ASCII_NAME}.vmx"
     return f"C:\\VMs\\{key}\\{key}.vmx"
 
 
-def build_inventory(*, include_stubs: bool = True, encoding: str = "windows-1251") -> bytes:
+def build_inventory(
+    *,
+    include_stubs: bool = True,
+    encoding: str = "windows-1251",
+    extra_entries: dict[str, tuple[str, str]] | None = None,
+) -> bytes:
     """Build a byte-exact inventory.vmls equivalent.
 
     Block layout mirrors the live file: config, DisplayName, ParentID, ItemID,
     SeqID, IsFavorite, IsClone, CfgVersion, State, UUID, IsCfgPathNormalized.
+
+    Args:
+        include_stubs: Append the empty-config blocks the live file carries.
+        encoding: The `.encoding` directive value.
+        extra_entries: Additional `name -> (uuid, vmx)` entries, appended after
+            the fixed ones. Used to simulate a VM registered after startup.
     """
     out: list[str] = [f'.encoding = "{encoding}"']
 
-    for n, (key, (name, uuid)) in enumerate(VMS.items(), start=2):
+    # (display name, uuid, vmx) for every real entry.
+    entries: list[tuple[str, str, str]] = [
+        (name, uuid, vmx_path(key)) for key, (name, uuid) in VMS.items()
+    ]
+    entries += [
+        (name, uuid, vmx) for name, (uuid, vmx) in (extra_entries or {}).items()
+    ]
+
+    for n, (name, uuid, config) in enumerate(entries, start=2):
         out += [
-            f'vmlist{n}.config = "{vmx_path(key)}"',
+            f'vmlist{n}.config = "{config}"',
             f'vmlist{n}.DisplayName = "{name}"',
             f'vmlist{n}.ParentID = "0"',
             f'vmlist{n}.ItemID = "{n}"',
@@ -78,7 +103,8 @@ def build_inventory(*, include_stubs: bool = True, encoding: str = "windows-1251
 
     if include_stubs:
         # Blocks with an empty config: present in the file, no VM behind them.
-        for n in (3, 4, 5, 6, 7, 14):
+        # Numbered well past the real entries so they cannot collide with one.
+        for n in (20, 21, 22, 23, 24, 25):
             out += [
                 f'vmlist{n}.config = ""',
                 f'vmlist{n}.DisplayName = ""',
@@ -108,14 +134,13 @@ def build_inventory(*, include_stubs: bool = True, encoding: str = "windows-1251
 
 @pytest.fixture
 def loaded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> roster.RosterSnapshot:
-    """A registry loaded from the fixture, with the module cache pointed at it."""
+    """A registry loaded from the fixture."""
     registry_file = tmp_path / "inventory.vmls"
     registry_file.write_bytes(build_inventory())
 
     monkeypatch.setattr(roster, "inventory_path", lambda: registry_file)
-    monkeypatch.setattr(roster, "_cache", None, raising=False)
 
-    return roster.refresh()
+    return roster.registry()
 
 
 # --- parsing -------------------------------------------------------------
@@ -226,12 +251,6 @@ def test_uuid_comparison_ignores_case_and_separators(
     assert vm.name == "provider: GOAD-DC01"
 
 
-def test_uuid_wins_over_name(loaded: roster.RosterSnapshot) -> None:
-    """An explicit uuid is never second-guessed by a name."""
-    vm = roster.resolve(uuid=VMS["dc01"][1], name="provider: GOAD-DC02")
-    assert vm.name == "provider: GOAD-DC01"
-
-
 def test_falls_back_to_name(loaded: roster.RosterSnapshot) -> None:
     vm = roster.resolve(name="provider: GOAD-DC02")
     assert vm.name == "provider: GOAD-DC02"
@@ -280,32 +299,187 @@ def test_empty_identifier_raises(loaded: roster.RosterSnapshot) -> None:
         roster.resolve(name="   ")
 
 
-def test_unavailable_registry_fails_closed(loaded: roster.RosterSnapshot) -> None:
+def test_unavailable_registry_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """With an unreadable registry, resolution must refuse rather than accept.
 
     This is the security boundary for every future mutating tool: the safe
     failure is "I will not touch anything", not "no match, so try this other
     thing".
     """
-    broken = roster.RosterSnapshot(vms=(), error="registry unreadable")
-    roster._cache = broken  # noqa: SLF001 — deliberate cache poisoning
+    monkeypatch.setattr(roster, "inventory_path", lambda: tmp_path / "gone.vmls")
 
     with pytest.raises(roster.RosterError):
         roster.resolve(name="provider: GOAD-DC01")
 
 
-# --- caching -------------------------------------------------------------
+# --- freshness ------------------------------------------------------------
 
 
-def test_refresh_replaces_the_cache(loaded: roster.RosterSnapshot) -> None:
-    """Read once at startup, cached -- with an explicit refresh as the escape
-    hatch for a VM registered after the server started."""
-    assert roster._snapshot() is roster._snapshot()  # noqa: SLF001
+def test_a_vm_registered_after_startup_is_visible(
+    loaded: roster.RosterSnapshot, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No cache: a VM registered while the server is running resolves at once.
 
-    again = roster.refresh()
+    The tool that previously cached this returned a stale roster, so
+    `list_vms` could show a VM that `vm_status` then refused. Re-reading costs
+    under a millisecond and removes a whole class of "it depends what you called
+    first" bugs.
+    """
+    registry_file = tmp_path / "inventory.vmls"
+    assert loaded.ok
 
-    assert again.ok
-    assert len(again.vms) == len(VMS)
+    registry_file.write_bytes(
+        build_inventory(extra_entries={"NewVM": (NEW_UUID, r"C:\vm\NewVM.vmx")})
+    )
+
+    found = roster.resolve(name="NewVM")
+    assert found.normalized_uuid == normalize_uuid(NEW_UUID)
+
+
+# --- name matching --------------------------------------------------------
+
+
+def test_name_without_the_registry_prefix_resolves(
+    loaded: roster.RosterSnapshot,
+) -> None:
+    """`GOAD-DC01` must find the VM the registry calls `provider: GOAD-DC01`.
+
+    Refusing correct input because the registry carries a Vagrant prefix makes
+    the tool unusable: the caller has done everything right and is still told
+    the VM does not exist.
+    """
+    assert roster.resolve(name="GOAD-DC01").normalized_uuid == normalize_uuid(VMS["dc01"][1])
+
+
+def test_prefix_stripped_name_is_case_insensitive(
+    loaded: roster.RosterSnapshot,
+) -> None:
+    assert roster.resolve(name="goad-dc01").normalized_uuid == normalize_uuid(VMS["dc01"][1])
+
+
+def test_vmx_filename_stem_resolves(
+    loaded: roster.RosterSnapshot,
+) -> None:
+    """The `.vmx` stem is the label a user sees in Explorer, often not the
+    display name at all."""
+    stem = Path(vmx_path("cyr")).stem
+    assert roster.resolve(name=stem).normalized_uuid == normalize_uuid(VMS["cyr"][1])
+
+
+def test_shared_vmx_stem_is_ambiguous_not_a_guess(
+    loaded: roster.RosterSnapshot,
+) -> None:
+    """Both GOAD domain controllers ship a `WindowsServer2019.vmx`.
+
+    Matching the filename stem therefore cannot identify one of them. Picking
+    the first would answer about an arbitrary machine, which for a tool that
+    will eventually power VMs off is the wrong thing to do confidently.
+    """
+    with pytest.raises(roster.AmbiguousName) as excinfo:
+        roster.resolve(name="WindowsServer2019")
+
+    assert len(excinfo.value.candidates) == 2
+
+
+def test_unique_substring_resolves(loaded: roster.RosterSnapshot) -> None:
+    """A fragment is enough when only one VM can match."""
+    assert roster.resolve(name="wazuh").normalized_uuid == normalize_uuid(VMS["wazuh"][1])
+
+
+def test_ambiguous_substring_is_an_error_not_a_guess(
+    loaded: roster.RosterSnapshot,
+) -> None:
+    """`DC0` is a substring of every domain controller. Picking the first match
+    would answer about an arbitrary one."""
+    with pytest.raises(roster.AmbiguousName) as excinfo:
+        roster.resolve(name="DC0")
+
+    assert len(excinfo.value.candidates) > 1
+
+
+def test_very_short_query_does_not_fuzzy_match(
+    loaded: roster.RosterSnapshot,
+) -> None:
+    """`01` is a substring of half the lab, so below the length floor a query
+    only matches exactly."""
+    with pytest.raises(roster.UnknownVm):
+        roster.resolve(name="01")
+
+
+# --- identifier handling --------------------------------------------------
+
+
+def test_uuid_passed_as_name_still_resolves(
+    loaded: roster.RosterSnapshot,
+) -> None:
+    """A caller who pastes a uuid into `name` should get the VM, not a
+    'no such display name' error about a perfectly good uuid."""
+    assert roster.resolve(name=VMS["dc01"][1]).normalized_uuid == normalize_uuid(VMS["dc01"][1])
+
+
+def test_unknown_name_error_lists_what_is_registered(
+    loaded: roster.RosterSnapshot,
+) -> None:
+    """An error that names the alternatives is the difference between one retry
+    and a dead end."""
+    with pytest.raises(roster.UnknownVm) as excinfo:
+        roster.resolve(name="no-such-vm")
+
+    message = str(excinfo.value)
+    assert "provider: GOAD-DC01" in message
+    assert "list_vms" in message
+
+
+def test_agreeing_uuid_and_name_are_accepted(
+    loaded: roster.RosterSnapshot,
+) -> None:
+    """Redundant identifiers that agree are not an error; some clients send
+    both for safety."""
+    vm = roster.resolve(uuid=VMS["dc01"][1], name="GOAD-DC01")
+    assert vm.normalized_uuid == normalize_uuid(VMS["dc01"][1])
+
+
+def test_uuid_and_name_pointing_at_different_vms_is_an_error(
+    loaded: roster.RosterSnapshot,
+) -> None:
+    """Silently preferring the uuid would discard half the caller's intent, and
+    this resolution is the trust boundary future power tools will sit behind."""
+    with pytest.raises(roster.IdentifierMismatch) as excinfo:
+        roster.resolve(uuid=VMS["dc01"][1], name="wazuh-4.7.5")
+
+    message = str(excinfo.value)
+    assert "provider: GOAD-DC01" in message
+    assert "wazuh-4.7.5" in message
+
+
+# --- error taxonomy -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        pytest.param(roster.UnknownVm, id="unknown"),
+        pytest.param(roster.AmbiguousName, id="ambiguous"),
+        pytest.param(roster.IdentifierMismatch, id="mismatch"),
+    ],
+)
+def test_every_resolution_error_is_catchable_as_roster_error(
+    exc: type[Exception],
+) -> None:
+    """Regression guard for a real bug.
+
+    This module briefly defined `RosterError` twice. `IdentifierMismatch`
+    subclassed the first definition; the second then shadowed the name. Every
+    direct test still passed, because `pytest.raises(roster.IdentifierMismatch)`
+    compares the concrete class -- but `except roster.RosterError` in the server
+    no longer matched it, so a caller got a generic framework error instead of
+    the message explaining which two identifiers disagreed.
+
+    Asserting the hierarchy directly is the only thing that catches it.
+    """
+    assert issubclass(exc, roster.RosterError)
 
 
 def test_normalize_uuid_strips_every_separator() -> None:

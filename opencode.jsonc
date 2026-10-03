@@ -11,13 +11,14 @@
   // crash in opencode cannot take the lab tools down with it.
   //
   // Start the server yourself first:
-  //   .venv\Scripts\python.exe -m vm_mcp.test_server --transport http
+  //   .venv\Scripts\vm-mcp.exe --transport http
+  //   .venv\Scripts\python.exe -m vm_mcp --transport http
   // It prints the URL it is serving on, plus a warning: this endpoint has no
   // authentication, so anything that can reach it can call every tool. The
   // bind is loopback for that reason. Do not widen the bind without settling
   // the auth question first.
   //
-  // The port below must match DEFAULT_HTTP_PORT in src/vm_mcp/test_server.py.
+  // The port below must match DEFAULT_HTTP_PORT in src/vm_mcp/server.py.
   // There is no environment variable that could change one without the other.
   "mcp": {
     "vmware": {

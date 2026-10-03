@@ -118,6 +118,59 @@ def _norm_path(path: str) -> str:
     return path.replace("/", "\\").lower()
 
 
+# `.vmx` `guestos` values are VMware identifiers like `windows9srv-64`,
+# `ubuntu-64` or `otherlinux-64`. An agent asked "is this Windows?" would have to
+# know that vocabulary to answer, and a wrong guess there is worse than no
+# answer.
+#
+# Matched by prefix, not by substring. "darwin-64" contains "win" and
+# "otherlinux-64" contains "linux", so substring matching reports a macOS guest as
+# Windows and VMware's own "I cannot classify this" marker as Linux. Order is
+# therefore part of the correctness: every entry that is a prefix of another must
+# come first.
+_OS_FAMILIES: tuple[tuple[str, str], ...] = (
+    ("darwin", "macos"),
+    # VMware's catch-all. Must precede "linux", which it contains.
+    ("otherlinux", "other"),
+    ("other", "other"),
+    ("windows", "windows"),
+    ("win", "windows"),
+    ("msdos", "dos"),
+    ("freebsd", "bsd"),
+    ("netbsd", "bsd"),
+    ("openbsd", "bsd"),
+    ("solaris", "solaris"),
+    ("ubuntu", "linux"),
+    ("debian", "linux"),
+    ("rhel", "linux"),
+    ("redhat", "linux"),
+    ("centos", "linux"),
+    ("fedora", "linux"),
+    ("sles", "linux"),
+    ("linux", "linux"),
+)
+
+
+def os_family(guestos: str) -> str:
+    """Coarse guest OS family for a VMware `guestos` identifier.
+
+    Args:
+        guestos: The raw `.vmx` value, e.g. `windows9srv-64`.
+
+    Returns:
+        One of `windows`, `linux`, `bsd`, `solaris`, `macos`, `dos`, `other`, or
+        `unknown`. `other` is not a failure: VMware uses `otherlinux-64` for
+        guests it cannot classify, and reporting that as "linux" would overstate
+        what we know. `unknown` means the value matched no known identifier at
+        all.
+    """
+    folded = guestos.strip().casefold()
+    for prefix, family in _OS_FAMILIES:
+        if folded.startswith(prefix):
+            return family
+    return "unknown"
+
+
 def _read_vmx_fields(vmx_path: str) -> dict[str, str]:
     """Parse the top of a `.vmx` into a lowercase-keyed field dict.
 
@@ -177,21 +230,27 @@ async def list_vms() -> dict[str, Any]:
 
     Returns:
         A dict with:
-          vms: one entry per registered VM, each with `name` (display name;
+          vms: one entry per registered VM, each with `name` (display name,
               renamable and not unique), `uuid` (stable hardware identifier --
-              use this to refer to a VM unambiguously), `vmx` (path to its
-              config file), and `power_state`.
+              use this to refer to a VM) and `power_state`.
           counts: total registered, and how many are running.
           observed_via: `vmrun-list` when power state came from VMware, or
               `unavailable` if VMware could not be queried -- in which case
               every `power_state` is `unknown` rather than guessed.
 
     Note:
+        The `.vmx` path is not included. Callers cannot act on a path anyway --
+        vm_status resolves identifiers against the registry -- and the Vagrant
+        paths run to ~190 characters each, which is most of the payload for
+        information nothing can use. `vm_status` returns the path for one VM
+        when you need to see where it lives.
+
+    Note:
         Lists what VMware Workstation knows about: VMs registered on this user
         account. A .vmx started directly with vmrun without being registered
         will not appear.
     """
-    snapshot = roster.refresh()
+    snapshot = roster.registry()
 
     if not snapshot.ok:
         return {
@@ -207,7 +266,6 @@ async def list_vms() -> dict[str, Any]:
         {
             "name": vm.name,
             "uuid": vm.uuid,
-            "vmx": vm.vmx,
             "power_state": states.get(_norm_path(vm.vmx), POWER_UNKNOWN),
         }
         for vm in snapshot.vms
@@ -237,21 +295,33 @@ async def vm_status(uuid: str | None = None, name: str | None = None) -> dict[st
     Args:
         uuid: The VM's hardware UUID, as reported by `list_vms`. Spaced or
             undashed forms both work. Survives a display-name rename.
-        name: Display name. Use when the UUID is not known. An ambiguous name
-            is an error listing the candidates, not a guess.
+        name: Name or label of the VM. Matched loosely, so `GOAD-DC01` finds a
+            VM the registry calls `provider: GOAD-DC01`, and `WindowsServer2019`
+            works too. A name matching several VMs is an error listing the
+            candidates, not a guess.
+            Passing both `uuid` and `name` is allowed when they agree and is an
+            error when they do not.
 
     Returns:
         A dict with:
-          name, uuid, vmx: identity, from the VMware registry.
+          name, uuid: identity, from the VMware registry.
+          vmx: path to the VM's config file. Included here, but not in
+              `list_vms`: for one VM it is worth the characters when you need to
+              see where it lives, and for a list it is mostly noise.
           power_state: `running`, `stopped`, or `unknown` if VMware could not be
               queried.
           vcpu: Configured virtual CPU count. A setting, not current CPU load.
           mem_mb: Configured memory in megabytes. A ceiling the VM is allowed to
               use, not current usage -- a stopped VM reports this number while
               using none of it.
-          guest_os: The guest operating system identifier, e.g.
-              `windows9srv-64` or `ubuntu-64`. Read from the .vmx because the
-              registry's own copy of this is unreliable.
+          guest_os: The guest operating system identifier as VMware spells it,
+              e.g. `windows9srv-64` or `ubuntu-64`. Read from the .vmx because
+              the registry's own copy of this is unreliable.
+          os_family: Coarse family for `guest_os` -- `windows`, `linux`, `bsd`,
+              `solaris`, `macos`, `dos`, `other`, or `unknown`. Present so you can
+              ask "is this Windows?" without knowing VMware's vocabulary. `other`
+              means VMware could not classify the guest, which is not the same
+              as `unknown`, which means we could not read the field.
           tools_state: VMware Tools state. `running` when the guest agent is
               active, `installed` when present but the VM is off. Says nothing
               about a powered-off guest, so it is reported as undetermined
@@ -264,9 +334,10 @@ async def vm_status(uuid: str | None = None, name: str | None = None) -> dict[st
     """
     try:
         vm = roster.resolve(uuid=uuid, name=name)
-    except roster.AmbiguousName as exc:
-        raise ToolError(str(exc)) from exc
     except roster.RosterError as exc:
+        # Covers UnknownVm, AmbiguousName and IdentifierMismatch. Each already
+        # carries a message written for the caller, including what *is*
+        # available when the identifier did not match.
         raise ToolError(str(exc)) from exc
 
     states, vmrun_error = await _power_states((vm,))
@@ -296,8 +367,7 @@ async def vm_status(uuid: str | None = None, name: str | None = None) -> dict[st
 
     if "guestos" in fields:
         result["guest_os"] = fields["guestos"]
-    if "displayname" in fields:
-        result["display_name"] = fields["displayname"]
+        result["os_family"] = os_family(fields["guestos"])
 
     # VMware Tools is only meaningful for a running guest. Calling
     # checkToolsState on a powered-off VM costs 0.65-3.5s to learn `installed`,
@@ -412,10 +482,10 @@ def _port_is_free(host: str, port: int) -> bool:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
-    # Warm the registry cache once, here, rather than on the first tool call.
-    # Under a millisecond, and it keeps the first call free of file I/O. Failure
-    # is not fatal: the tools report the registry error themselves.
-    snapshot = roster.refresh()
+    # Read the registry once here, so a broken one is reported at boot instead of
+    # on the first tool call, and so the banner can say what was found. Tools
+    # re-read per call; this is a health check, not a cache.
+    snapshot = roster.registry()
     if snapshot.ok:
         print(
             f"vm_mcp: VMware registry: {len(snapshot.vms)} VMs registered",

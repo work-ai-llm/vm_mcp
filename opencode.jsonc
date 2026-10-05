@@ -10,9 +10,12 @@
   // it, so opencode starting and stopping has no effect on the server, and a
   // crash in opencode cannot take the lab tools down with it.
   //
-  // Start the server yourself first:
-  //   .venv\Scripts\vm-mcp.exe --transport http
-  //   .venv\Scripts\python.exe -m vm_mcp --transport http
+  // Start the server yourself first (the venv is one level up, shared):
+  //   ..\.venv\Scripts\vm-mcp.exe --transport http
+  //   ..\.venv\Scripts\python.exe -m vm_mcp --transport http
+  //   python vm_mcp.py --transport http
+  // The last one is the one to use from a git worktree: it runs that worktree's
+  // code, where the other two run whichever checkout the venv was installed in.
   // It prints the URL it is serving on, plus a warning: this endpoint has no
   // authentication, so anything that can reach it can call every tool. The
   // bind is loopback for that reason. Do not widen the bind without settling

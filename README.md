@@ -104,14 +104,55 @@ Start the server yourself; opencode only connects.
 
 ```powershell
 # Terminal 1 — the server, running independently
-.venv\Scripts\vm-mcp.exe --transport http
+..\.venv\Scripts\vm-mcp.exe --transport http
 
 # equivalently, without relying on the console script being installed:
-.venv\Scripts\python.exe -m vm_mcp --transport http
+..\.venv\Scripts\python.exe -m vm_mcp --transport http
+
+# or, needing neither the console script nor the editable install:
+python vm_mcp.py --transport http
 
 # Terminal 2 — opencode, from this directory
 opencode
 ```
+
+The venv lives at `..\.venv`, one level above the repository, so that it is the project's
+single shared environment rather than an asset of the main checkout. Activate it with
+`..\.venv\Scripts\Activate.ps1`.
+
+### Launching from a worktree
+
+`vm_mcp.py` at the repository root is a launcher, and it is the one to use when working
+in a [git worktree](https://git-scm.com/docs/git-worktree). The other two forms resolve
+the package through the venv's `__editable__*.pth`, which names exactly one checkout —
+so in a second worktree they would quietly run the *first* worktree's code.
+
+`vm_mcp.py` puts its own `src` ahead of that, so each worktree runs its own code, and the
+one shared `.venv` is enough for all of them:
+
+```powershell
+git worktree add ..\feature-x -b feature-x
+..\.venv\Scripts\python.exe ..\feature-x\vm_mcp.py --transport http
+```
+
+No `pip install -e .` per worktree. `research\` and `PLAN.md` live one level above the
+repository, outside Git, and are reached from any worktree as `..\research\` and
+`..\PLAN.md`.
+
+### One consequence of the launcher's name
+
+`vm_mcp.py` sits beside the package it imports, so it shadows it for anything that has the
+repository root on `sys.path` and does a bare `import vm_mcp`. From the repository root:
+
+```powershell
+python -m vm_mcp --help            # fine -- runpy executes the launcher
+python -c "import vm_mcp"          # ModuleNotFoundError: 'vm_mcp' is not a package
+python vm_mcp.py --help            # fine -- the launcher inserts src ahead of itself
+pytest                             # fine -- pyproject sets pythonpath = ["src"]
+```
+
+`python -c "import vm_mcp"` is the only casualty, and it is a diagnostic one-liner rather
+than a launch path. `import vm_mcp` from any other directory is unaffected.
 
 ```jsonc
 {
@@ -143,7 +184,7 @@ on the port, opencode reports `✗ failed` and offers no tools.
       "command": [
         "D:\\llms\\models\\testing\\vm_mcp\\.venv\\Scripts\\vm-mcp.exe"
       ],
-      "cwd": "D:\\llms\\models\\testing\\vm_mcp",
+      "cwd": "D:\\llms\\models\\testing\\vm_mcp\\vm_mcp",
       "enabled": true,
       "timeout": 15000
     }

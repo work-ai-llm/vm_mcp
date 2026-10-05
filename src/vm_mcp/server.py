@@ -34,17 +34,20 @@ registry is read in `main()`, not at module scope.
 
 Module layout
 -------------
-This file is `server.py`, not `vm_mcp.py`. A module named after the package it
-lives in shadows it: running `python vm_mcp.py` from inside this directory puts
-this directory on `sys.path`, so `from vm_mcp import roster` below resolves to
-*this file* instead of the package and fails with an ImportError that reads like
-a circular import. It is not one. Launch with any of:
+This file is `server.py`, not `vm_mcp.py`, and that is deliberate. A module named after
+the package it lives in shadows it: running such a module puts its own directory on
+`sys.path`, so `from vm_mcp import roster` below resolves to the file instead of the
+package and fails with an ImportError that reads like a circular import. It is not one.
+Launch with any of:
 
     python -m vm_mcp                    # shortest
     python -m vm_mcp.server
-    vm-mcp                               # console script, from the venv
+    vm-mcp                              # console script, from the venv
+    python vm_mcp.py                    # repo root; the one to use in a worktree
 
-`__main__.py` exists so the shortest form works.
+`__main__.py` exists so the shortest form works. The root `vm_mcp.py` takes the hit this
+file avoids -- it is named after the package on purpose and puts `src` ahead of itself to
+compensate, which is what lets one venv serve every worktree.
 """
 
 from __future__ import annotations

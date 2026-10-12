@@ -160,6 +160,10 @@ python vm_mcp.py --transport http
 opencode
 ```
 
+Stop the server with Ctrl+C. It shuts down gracefully and prints one line,
+`vm_mcp: interrupted -- shut down cleanly`, rather than the CancelledError
+traceback that a graceful uvicorn shutdown otherwise leaves behind.
+
 The venv lives at `..\.venv`, one level above the repository, so that it is the project's
 single shared environment rather than an asset of the main checkout. Activate it with
 `..\.venv\Scripts\Activate.ps1`.

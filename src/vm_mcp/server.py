@@ -63,7 +63,7 @@ import argparse
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import psutil
 from mcp.server import MCPServer
@@ -643,6 +643,27 @@ def _port_is_free(host: str, port: int) -> bool:
     return True
 
 
+_INTERRUPTED = "vm_mcp: interrupted -- shut down cleanly"
+
+
+def _run_transport(run: Callable[[], None]) -> None:
+    """Run a transport, turning Ctrl+C into a clean stop instead of a traceback.
+
+    Ctrl+C is not a failure, but by default it looks like one. uvicorn captures
+    SIGINT to shut down gracefully and then re-raises it, so a KeyboardInterrupt
+    arrives here -- after the server has already stopped and reported
+    "Application shutdown complete". Anyio re-raises it too. Left uncaught, the
+    interpreter prints a CancelledError traceback, then "During handling of the
+    above exception, another exception occurred", then KeyboardInterrupt, and
+    exits with the Ctrl+C status code. None of that is true: the shutdown
+    succeeded. So the interrupt is caught and reported as what it is.
+    """
+    try:
+        run()
+    except KeyboardInterrupt:
+        print(_INTERRUPTED, file=sys.stderr, flush=True)
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
@@ -676,16 +697,18 @@ def main(argv: list[str] | None = None) -> None:
 
         # stderr, never stdout. See the module docstring.
         print(http_banner(args.host, args.port, args.path), file=sys.stderr, flush=True)
-        mcp.run(
-            transport="streamable-http",
-            host=args.host,
-            port=args.port,
-            streamable_http_path=args.path,
+        _run_transport(
+            lambda: mcp.run(
+                transport="streamable-http",
+                host=args.host,
+                port=args.port,
+                streamable_http_path=args.path,
+            )
         )
         return
 
     print(f"vm_mcp {__version__} starting on stdio", file=sys.stderr, flush=True)
-    mcp.run()
+    _run_transport(mcp.run)
 
 
 if __name__ == "__main__":

@@ -36,10 +36,14 @@ from pathlib import Path
 
 __all__ = [
     "VMRUN_PATH",
+    "STOP_HARD",
+    "STOP_SOFT",
     "VmrunResult",
     "VmrunUnavailable",
     "run_vmrun",
+    "spawn_vmrun",
     "list_running_vmx",
+    "power_on",
     "tools_state",
     "get_guest_ip",
     "parse_list_output",
@@ -59,6 +63,28 @@ VMRUN_PATH = Path(
 # are for a genuinely hung process, not for slow success.
 DEFAULT_TIMEOUT = 20.0
 LIST_TIMEOUT = 15.0
+
+# Power-on returns as soon as the VM is powered on; measured 1.8s cold and 3.1s
+# on this host, with outliers up to 3.4s. `nogui` keeps the command non-blocking
+# and means no VMware window appears for a machine nobody is watching.
+START_TIMEOUT = 60.0
+
+# `stop ... hard` is measured at 0.9-1.2s and waits for nothing. `stop ... soft`
+# is a *different animal entirely* and was verified rather than assumed:
+#
+#     vmrun -T ws stop "<VMX>" soft   ->  exit 0 after 26.3s
+#
+# It does not return when the request is delivered, it returns when the guest
+# has actually shut down -- which is the correct behaviour for a graceful stop,
+# and the reason the two modes need different timeouts rather than one shared
+# "stop" constant. A generous ceiling covers a Windows domain controller draining
+# Active Directory; exceeding it is not automatically an error, so callers that
+# care should poll `list` instead of trusting this timeout alone.
+STOP_HARD_TIMEOUT = 60.0
+STOP_SOFT_TIMEOUT = 900.0
+
+STOP_SOFT = "soft"
+STOP_HARD = "hard"
 
 
 class VmrunUnavailable(RuntimeError):
@@ -86,43 +112,8 @@ class VmrunResult:
     exit_code: int
 
 
-async def run_vmrun(
-    args: list[str],
-    *,
-    timeout: float = DEFAULT_TIMEOUT,
-    executable: Path | None = None,
-) -> VmrunResult:
-    """Run `vmrun -T ws <args>` and return its output.
-
-    Args:
-        args: Subcommand and its arguments, e.g. `["list"]`.
-        timeout: Seconds before the process is killed.
-        executable: Override the vmrun binary path. Tests use this.
-
-    Returns:
-        A VmrunResult. `ok` is False if the exit code was non-zero.
-
-    Raises:
-        VmrunUnavailable: vmrun is missing, could not be started, or timed out.
-    """
-    binary = Path(executable) if executable is not None else VMRUN_PATH
-
-    if not binary.is_file():
-        raise VmrunUnavailable(f"vmrun not found at {binary}")
-
-    # -T ws pins the target to the local Workstation instance. Without it
-    # vmrun probes for vix servers and can stall on a network lookup.
-    command = [str(binary), "-T", "ws", *args]
-
-    try:
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    except OSError as exc:
-        raise VmrunUnavailable(f"could not start vmrun: {exc}") from exc
-
+async def _collect(process: "asyncio.subprocess.Process", args: list[str], timeout: float) -> VmrunResult:
+    """Wait for a spawned vmrun, bounded, and decode its merged output."""
     try:
         raw_out, raw_err = await asyncio.wait_for(
             process.communicate(), timeout=timeout
@@ -147,6 +138,69 @@ async def run_vmrun(
 
     exit_code = process.returncode if process.returncode is not None else -1
     return VmrunResult(ok=exit_code == 0, stdout=text, exit_code=exit_code)
+
+
+async def spawn_vmrun(
+    args: list[str],
+    *,
+    executable: Path | None = None,
+) -> "asyncio.subprocess.Process":
+    """Start `vmrun -T ws <args>` and hand back the live process.
+
+    The only reason this exists, and the reason it is not the default path: a
+    graceful `stop` **blocks until the guest has finished shutting down**
+    (measured 26.3s for the Ubuntu jumpbox). Awaiting it would mean the caller
+    cannot observe the VM's actual power state while the shutdown is in
+    progress, which is precisely the thing worth observing. Spawning lets the
+    poll ladder watch `vmrun list` while the shutdown runs, instead of guessing
+    at the outcome and reporting success for something that may still be going.
+
+    The caller owns the process and is responsible for consuming it (via
+    `_collect`, or by killing it). Nothing here enforces that.
+
+    Raises:
+        VmrunUnavailable: vmrun is missing or could not be started.
+    """
+    binary = Path(executable) if executable is not None else VMRUN_PATH
+
+    if not binary.is_file():
+        raise VmrunUnavailable(f"vmrun not found at {binary}")
+
+    # -T ws pins the target to the local Workstation instance. Without it
+    # vmrun probes for vix servers and can stall on a network lookup.
+    command = [str(binary), "-T", "ws", *args]
+
+    try:
+        return await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        raise VmrunUnavailable(f"could not start vmrun: {exc}") from exc
+
+
+async def run_vmrun(
+    args: list[str],
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    executable: Path | None = None,
+) -> VmrunResult:
+    """Run `vmrun -T ws <args>` and return its output.
+
+    Args:
+        args: Subcommand and its arguments, e.g. `["list"]`.
+        timeout: Seconds before the process is killed.
+        executable: Override the vmrun binary path. Tests use this.
+
+    Returns:
+        A VmrunResult. `ok` is False if the exit code was non-zero.
+
+    Raises:
+        VmrunUnavailable: vmrun is missing, could not be started, or timed out.
+    """
+    process = await spawn_vmrun(args, executable=executable)
+    return await _collect(process, args, timeout)
 
 
 def parse_list_output(stdout: str) -> list[str]:
@@ -219,6 +273,35 @@ async def list_running_vmx(
         raise VmrunUnavailable("vmrun list reported an error")
 
     return parse_list_output(result.stdout)
+
+
+async def power_on(
+    vmx_path: str | Path,
+    *,
+    timeout: float = START_TIMEOUT,
+    executable: Path | None = None,
+) -> VmrunResult:
+    """Power on a VM without a console window.
+
+    Issues `vmrun start <vmx> nogui`.
+
+    Two things about the return value that are easy to get wrong:
+
+    * **`nogui` is what makes this usable.** Without it VMware opens a window for
+      a machine nobody is sitting in front of.
+    * **This returning means "power-on accepted", not "guest usable".** Measured
+      on this host: `start` exits 0 after 1.8s cold / 3.1s warm, and the guest
+      does not become reachable for a further **~156s**. A caller that reads exit
+      zero as "the VM is up and working" is wrong for two and a half minutes.
+
+    Raises:
+        VmrunUnavailable: vmrun failed, timed out, or rejected the path.
+    """
+    return await run_vmrun(
+        ["start", str(vmx_path), "nogui"],
+        timeout=timeout,
+        executable=executable,
+    )
 
 
 async def tools_state(

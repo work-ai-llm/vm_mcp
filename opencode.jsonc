@@ -17,12 +17,40 @@
   // The last one is the one to use from a git worktree: it runs that worktree's
   // code, where the other two run whichever checkout the venv was installed in.
   // It prints the URL it is serving on, plus a warning: this endpoint has no
-  // authentication, so anything that can reach it can call every tool. The
-  // bind is loopback for that reason. Do not widen the bind without settling
-  // the auth question first.
+  // authentication, so anything that can reach it can call every tool -- which
+  // since M2 includes power-off. The bind is loopback for that reason.
   //
   // The port below must match DEFAULT_HTTP_PORT in src/vm_mcp/server.py.
   // There is no environment variable that could change one without the other.
+
+  // Tool gating ships WITH the power tools, not after them. Issue #11 flagged
+  // that leaving this to M5 would mean `stop_vm` and `restart_vm` reaching the
+  // model ungated on the day they land, which is precisely when they should not
+  // be.
+  //
+  // The three mutating tools are OFF by default. Enabling one is a deliberate
+  // edit to this file, made by someone who has decided that agent on this
+  // project may power the lab off. There is no prompt, no confirmation dialog
+  // and no second opinion between "an agent decided to stop a domain controller"
+  // and the machine going down -- so this block is the control, and it is the
+  // only one. Annotations on the tools are hints to the model, not enforcement.
+  //
+  // Note that the registry includes non-lab machines: the wazuh SIEM is
+  // registered, holds 8 GB, and `stop_vm("wazuh-4.7.5")` would work if enabled.
+  // The registry cannot tell a lab member from an appliance, so an operator
+  // enabling these should know which of the 8 VMs they are trusting an agent
+  // with. See the README's security posture section.
+  "tools": {
+    "vmware_list_vms": true,
+    "vmware_vm_status": true,
+    "vmware_host_resources": true,
+
+    // Flip to true to let an agent change power state.
+    "vmware_start_vm": false,
+    "vmware_stop_vm": false,
+    "vmware_restart_vm": false
+  },
+
   "mcp": {
     "vmware": {
       "type": "remote",
@@ -31,6 +59,19 @@
 
       // The measured handshake is ~1.6 s, so the 5000 ms default would work.
       // Raised to 15000 for headroom on a cold start.
+      //
+      // This is sized for `start_vm`, which returns in ~2-3s once the VM is
+      // confirmed running. It is NOT sized for a graceful stop: `stop_vm` on a
+      // real guest polls until the OS actually shuts down and took 61s in live
+      // verification. That exceeds this timeout, so the client will report the
+      // call as failed while the VM is in fact shutting down normally -- and the
+      // agent's next move, retrying, would then collide with the stop already in
+      // flight.
+      //
+      // Raising this is the fix, and it has not been done here because it is a
+      // client-visible tradeoff: a large timeout makes a genuinely hung call look
+      // slow rather than failed. Tracked as a follow-up alongside the guest_health
+      // milestone, which is where polling for readiness should properly live.
       "timeout": 15000
     }
   }

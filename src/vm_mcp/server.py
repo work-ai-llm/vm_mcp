@@ -413,9 +413,9 @@ async def vm_status(uuid: str | None = None, name: str | None = None) -> dict[st
 async def host_resources() -> dict[str, Any]:
     """Measure this host's CPU, memory and disk, and what the running VMs cost it.
 
-    Takes no arguments and reads only the host: no VMware process is started, no
-    `.vmx` is touched, and no VM is affected. It is the cheapest tool here and the
-    only one that never calls `vmrun`.
+    Takes no arguments and changes nothing: it reads the host, and to know which
+    VMs are running it reads the registry and the running set the same way
+    `list_vms` does.
 
     Returns:
         A dict with:
@@ -430,10 +430,12 @@ async def host_resources() -> dict[str, Any]:
           volumes: One entry per mounted local volume with total/used/free. A
               volume that cannot be read carries `error` instead of numbers and
               does not affect the others.
-          vmware: Resident memory of VMware's processes right now, largest first.
+          vmware: Resident memory of VMware's host processes right now, summed
+              across every VM, largest first. Aggregate only -- it is not broken
+              down per VM.
           vm_memory: Per-VM breakdown for running VMs only -- `configured_gib`
-              from its `.vmx` against `rss_gib` measured from its process. A
-              stopped VM is absent rather than reported as zero.
+              from its `.vmx`. A stopped VM is absent rather than reported as
+              zero.
           headroom_gib: Host available memory minus the configured memory of
               running VMs. Raw subtraction, and the reason this exists.
           uptime: Boot time, uptime in hours, and the host name.
@@ -445,9 +447,9 @@ async def host_resources() -> dict[str, Any]:
         rather than the amount of RAM -- and that overhead is not observable from
         outside the hypervisor. A positive `headroom_gib` therefore does **not**
         mean another VM will fit. A negative one does mean the configured
-        allocations already exceed available memory. To judge for real, compare
-        `rss_gib` against `configured_gib` per VM: that gap is overhead that is
-        already paid for.
+        allocations already exceed available memory. What a VM actually holds on
+        the host is only visible in aggregate, as `vmware`, and cannot be
+        attributed to individual VMs from here.
 
     Note:
         `load_percent` is absent-as-null when the sample window caught no CPU

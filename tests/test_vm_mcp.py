@@ -621,13 +621,21 @@ def test_stale_registry_entry_degrades_instead_of_failing(
 # --- annotations ---------------------------------------------------------
 
 
-def test_both_tools_are_advertised_as_read_only(lab, vmrun) -> None:
+def test_every_tool_is_advertised_as_read_only(lab, vmrun) -> None:
+    """Every tool in the set, not a hand-maintained pair.
+
+    This started as `test_both_tools_...` asserting exactly `list_vms` and
+    `vm_status`, which is a change-detector pointed the wrong way: adding
+    `host_resources` had to edit this test to keep it green, and deleting a tool
+    would have satisfied it. The set is asserted as a superset instead, and
+    exhaustively -- any tool added later is covered without being named here.
+    """
     async def go() -> list[Any]:
         return list(await server.mcp.list_tools())
 
     tools = asyncio.run(go())
 
-    assert {t.name for t in tools} == {"list_vms", "vm_status"}
+    assert {"list_vms", "vm_status", "host_resources"} <= {t.name for t in tools}
     for tool in tools:
         assert tool.description, f"{tool.name} has no description"
         assert tool.annotations is not None

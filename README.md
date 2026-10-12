@@ -11,10 +11,10 @@ Windows domain controller looks like from the outside.
 
 ## Status
 
-**M1 complete: two read-only tools, `list_vms` and `vm_status`. No mutating tool exists.**
+**M1 complete: three read-only tools, `list_vms`, `vm_status` and `host_resources`. No mutating tool exists.**
 
 Every tool in this repository is read-only. None can change a VM's power
-state, and the test suite never touches VMware — 87 tests pass with no VMware
+state, and the test suite never touches VMware — 124 tests pass with no VMware
 process started. The mutating half is deliberately not written yet; the
 allowlist that has to gate it is [#15](https://github.com/work-ai-llm/vm_mcp/issues/15).
 
@@ -27,6 +27,34 @@ allowlist that has to gate it is [#15](https://github.com/work-ai-llm/vm_mcp/iss
 | `start_vm` | mutating | Power on, optionally waiting for the guest to become ready. |
 | `stop_vm` | mutating | Power off. Graceful by default; hard-off is opt-in. |
 | `restart_vm` | mutating | Stop then start a single VM. |
+
+### `host_resources` reports headroom, and refuses to judge it
+
+The tool returns `headroom_gib` — host available memory minus the *configured*
+memory of running VMs — and that is the whole of its opinion. There is no
+"will another VM fit" field, deliberately, because VMware's per-VM overhead is
+not observable from outside the hypervisor. It is also per-VM rather than
+per-byte, so it grows with the *count* of VMs and not their size.
+
+Measured on this host while two VMs were running:
+
+```
+available            6.20 GiB
+configured (running) 5.95 GiB   -> headroom_gib  0.23   (looks fine)
+vmware process RSS   8.95 GiB                        (a VM already outweighs it)
+```
+
+A `headroom_gib` of 0.23 does not mean a third VM fits. To judge for real,
+compare each VM's `rss_gib` against its `configured_gib` — that gap is overhead
+already paid for, and both numbers are in the payload.
+
+Two smaller behaviours worth knowing:
+
+- `load_percent` is `null` when the sampling window caught no CPU counter ticks,
+  which on Windows is routine at this window length. That is "not measured", not
+  zero.
+- One unreadable volume carries `error` instead of numbers and does not affect
+  the others. `E:\` on this host always fails this way.
 
 The mutating tools are intended to ship disabled by default in client configuration,
 gated behind an explicit per-agent opt-in. `guest_health` is the reason the project

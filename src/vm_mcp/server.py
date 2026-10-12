@@ -1,8 +1,8 @@
 """vm_mcp — MCP server for a local VMware Workstation lab.
 
-MILESTONE 1: read-only inspection. Two tools are exposed, `list_vms` and
-`vm_status`, and neither of them can change a VM's state. Mutating tools land
-later and are gated on the allowlist design in issue #15.
+MILESTONE 1: read-only inspection. Three tools are exposed — `list_vms`,
+`vm_status` and `host_resources` — and none of them can change a VM's state.
+Mutating tools land later and are gated on the allowlist design in issue #15.
 
 Where the data comes from
 -------------------------
@@ -10,6 +10,13 @@ Where the data comes from
   (`inventory.vmls`), the same file the GUI uses to build its library.
 * *Which VMs are running* — one `vmrun -T ws list` call.
 * *Per-VM configuration* — the VM's own `.vmx` file, parsed read-only.
+* *Host capacity* — `hostinfo.py` reads the host through psutil and starts no
+  VMware process at all.
+
+The one thing `host_resources` will not do is answer "will another VM fit?".
+VMware's per-VM overhead is invisible from outside the hypervisor, so the tool
+reports the three raw quantities such an answer would need and leaves the
+arithmetic to the caller. See the tool's docstring and `PLAN.md` §4.
 
 Two sources for power state would be tempting and are not used: the registry
 has no notion of running state, and vmrun has no notion of existence. Each
@@ -58,11 +65,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import psutil
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
-from vm_mcp import roster
+from vm_mcp import hostinfo, roster
 from vm_mcp.vmrun import VmrunUnavailable, list_running_vmx, tools_state
 
 __version__ = "0.1.0"
@@ -397,6 +405,114 @@ async def vm_status(uuid: str | None = None, name: str | None = None) -> dict[st
 
     if vmrun_error:
         result["vmrun_error"] = vmrun_error
+
+    return result
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def host_resources() -> dict[str, Any]:
+    """Measure this host's CPU, memory and disk, and what the running VMs cost it.
+
+    Takes no arguments and reads only the host: no VMware process is started, no
+    `.vmx` is touched, and no VM is affected. It is the cheapest tool here and the
+    only one that never calls `vmrun`.
+
+    Returns:
+        A dict with:
+          cpu: Logical and physical core counts, current frequency when the
+              platform reports one, and `load_percent` -- busy CPU as a percentage
+              across all logical cores, sampled over `sample_window_s`.
+          memory: Host total, available, used and used-percent physical memory,
+              plus swap. Read `available_gib`, not `used_percent`, to judge
+              pressure: Windows counts most of the standby list as available, so a
+              host can read 80% used while still holding gigabytes it would
+              reclaim.
+          volumes: One entry per mounted local volume with total/used/free. A
+              volume that cannot be read carries `error` instead of numbers and
+              does not affect the others.
+          vmware: Resident memory of VMware's processes right now, largest first.
+          vm_memory: Per-VM breakdown for running VMs only -- `configured_gib`
+              from its `.vmx` against `rss_gib` measured from its process. A
+              stopped VM is absent rather than reported as zero.
+          headroom_gib: Host available memory minus the configured memory of
+              running VMs. Raw subtraction, and the reason this exists.
+          uptime: Boot time, uptime in hours, and the host name.
+
+    Note:
+        `headroom_gib` is arithmetic, not a verdict, and this tool will not turn it
+        into one. VMware reserves host memory outside each guest's configured
+        `memsize` -- and reserves it per-VM, so it grows with the number of VMs
+        rather than the amount of RAM -- and that overhead is not observable from
+        outside the hypervisor. A positive `headroom_gib` therefore does **not**
+        mean another VM will fit. A negative one does mean the configured
+        allocations already exceed available memory. To judge for real, compare
+        `rss_gib` against `configured_gib` per VM: that gap is overhead that is
+        already paid for.
+
+    Note:
+        `load_percent` is absent-as-null when the sample window caught no CPU
+        counter ticks, which on Windows happens routinely for windows this short.
+        That is "not measured", and is distinct from 0.
+    """
+    # CPU load needs two samples separated in time. Taking it on the event loop
+    # would stall every other tool call for the length of the window, so
+    # hostinfo does the reading on a thread.
+    sample = await hostinfo.cpu_load()
+
+    memory = hostinfo.host_memory()
+    vmware = hostinfo.vmware_process_memory()
+
+    # Which VMs are running, and what each is configured to use. Both are needed
+    # for the headroom figure and neither can come from vmware_process_memory:
+    # that sums RSS across processes with no mapping back to a VM.
+    snapshot = roster.registry()
+    states, vmrun_error = await _power_states(snapshot.vms)
+
+    per_vm: list[dict[str, Any]] = []
+    configured_total = 0
+    for vm in snapshot.vms:
+        if states.get(_norm_path(vm.vmx)) != POWER_RUNNING:
+            continue
+        vmx_path = Path(vm.vmx)
+        if not vmx_path.is_file():
+            continue
+        fields = _read_vmx_fields(vm.vmx)
+        raw = fields.get("memsize")
+        configured = int(raw) if raw and raw.isdigit() else None
+        entry: dict[str, Any] = {
+            "name": vm.name,
+            "uuid": vm.uuid,
+            "configured_gib": round(configured / 1024, 2) if configured else None,
+        }
+        if configured:
+            configured_total += configured
+        per_vm.append(entry)
+
+    per_vm.sort(key=lambda v: v["configured_gib"] or 0, reverse=True)
+
+    # memsize is in MiB; hostinfo.GIB is bytes-per-GiB. Both sides are converted
+    # from raw units rather than from the already-rounded gib fields above, so a
+    # 0.01 GiB rounding error does not leak into the subtraction.
+    available_bytes = psutil.virtual_memory().available
+    headroom_bytes = available_bytes - configured_total * hostinfo.MIB
+
+    result: dict[str, Any] = {
+        "cpu": hostinfo.host_cpu(sample),
+        "memory": memory,
+        "volumes": hostinfo.host_volumes(),
+        "vmware": vmware,
+        "vm_memory": per_vm,
+        "headroom_gib": round(headroom_bytes / hostinfo.GIB, 2),
+        "uptime": hostinfo.host_uptime(),
+    }
+
+    if vmrun_error:
+        # Without vmrun we cannot tell which VMs are running, so per_vm and
+        # headroom would be built from the wrong set -- silently, and reporting
+        # zero as though nothing runs. Both are withheld instead.
+        result["vm_memory_error"] = vmrun_error
+        result.pop("vm_memory")
+        result.pop("headroom_gib")
 
     return result
 

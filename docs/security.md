@@ -18,11 +18,11 @@ that ignores them gets the same response. The real controls are structural:
    identifier into a `.vmx` path, and it only ever returns a path the VMware
    registry itself lists. No caller-supplied path ever reaches `vmrun`, so a
    "resolve this path and power it on" primitive does not exist. See
-   [ADR 0002](decisions/0002-roster-and-list_vms.md).
+   [`architecture.md`](architecture.md).
 2. **The no-shell subprocess layer.** `vmrun` is invoked as an argument vector
    through `create_subprocess_exec`, never through a shell, so a VM named
    `a & b` is one argument and not a command. See
-   [ADR 0003](decisions/0003-vmrun-invocation.md).
+   [`architecture.md`](architecture.md).
 3. **Client-side gating of the mutating tools.** The mutating tools are intended
    to ship disabled by default in client configuration, gated behind an explicit
    per-agent opt-in — the `tools` block, not the server, is where that switch

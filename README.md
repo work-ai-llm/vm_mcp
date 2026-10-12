@@ -52,17 +52,14 @@ client config.
 The top-level README is the quick start. The reasoning lives in
 [`docs/`](docs/README.md):
 
+- [`docs/architecture.md`](docs/architecture.md) — the long-lived decisions:
+  why `vmrun`, the two transports, the SDK pin, the registry, the `vmrun` layer,
+  the tool-error contract.
+- [`docs/tools.md`](docs/tools.md) — how each read-only tool behaves and why.
 - [`docs/usage.md`](docs/usage.md) — running the server, the client config,
   worktrees, transports.
-- [`docs/design.md`](docs/design.md) — why `vmrun`, why two transports, why the
-  SDK is pinned.
-- [`docs/decisions/`](docs/decisions) — the decision records, one per issue,
-  for the read-only milestone.
 - [`docs/security.md`](docs/security.md) — the security posture and the real
   controls.
-- [`docs/host_resources.md`](docs/host_resources.md) — the host-capacity tool
-  and the decision not to compute "will it fit".
-- [`docs/lab.md`](docs/lab.md) — the live lab inventory.
 
 ## Build plan
 

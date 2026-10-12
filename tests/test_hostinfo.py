@@ -17,6 +17,11 @@ What is pinned, and why each of these was a real decision:
   * **A stopped VM is absent from `vm_memory`, not reported as zero.** Absent and
     zero are different claims: one means "not running", the other means "running
     and configured with nothing".
+  * **`rss_gib` is attributed per VM and is null, never 0, when unattributable.**
+    The host process names its VM via the `.vmx` on its command line; when that
+    cannot be read the VM is "not measured", and 0 would be a false claim that it
+    holds nothing. The aggregate and the per-VM figures are allowed to disagree,
+    because they answer different questions.
   * **When `vmrun` is unreachable, `vm_memory` and `headroom_gib` are withheld.**
     Without vmrun the running set is unknown, so both would be built from the
     wrong VMs while looking perfectly well-formed.
@@ -113,12 +118,17 @@ def fake_psutil(
     available_gib: int = 8,
     volumes: list[tuple[FakeVolume, FakeUsage | OSError]] | None = None,
     vmware_rss_mib: int = 6800,
+    vmware_vmx: str | None = None,
 ) -> dict[str, Any]:
     """Install a fake psutil across `hostinfo` and `server`.
 
     Both modules matter: `server` imports psutil directly for the headroom
     subtraction, so patching only `hostinfo` would leave the real host's numbers
     in half the result.
+
+    `vmware_vmx` is the `.vmx` the fake `vmware-vmx.exe` was started with. Set it
+    to the lab's running VM path to exercise per-VM RSS attribution; leave it
+    None to exercise the "running but unattributable" case.
     """
     spec: dict[str, Any] = {}
 
@@ -170,14 +180,32 @@ def fake_psutil(
     monkeypatch.setattr(hostinfo, "cpu_load", instant_cpu_load)
 
     class FakeProc:
-        def __init__(self, name: str, rss: int) -> None:
+        def __init__(self, name: str, rss: int, cmdline: list[str] | None = None,
+                     pid: int = 0) -> None:
             self.info = {
                 "name": name,
                 "memory_info": type("M", (), {"rss": rss})(),
             }
+            self.pid = pid
+            self._cmdline = cmdline or []
+
+        def cmdline(self) -> list[str]:
+            return list(self._cmdline)
+
+    # vmware-vmx carries its VM's .vmx as the final argument, the way the real
+    # process does. Tests that want RSS attributed to a VM pass its path as
+    # `vmware_vmx`; tests that want the unattributable case leave it unset.
+    vmx_cmdline = None
+    if vmware_vmx is not None:
+        vmx_cmdline = [
+            r"C:\Program Files (x86)\VMware\VMware Workstation\x64\vmware-vmx.exe",
+            "-s", "vmx.stdio.keep=TRUE",
+            "-@", r"pipe=\\.\pipe\vmxdeadbeef;msgs=ui",
+            vmware_vmx,
+        ]
 
     procs = [
-        FakeProc("vmware-vmx.exe", vmware_rss_mib * MIB),
+        FakeProc("vmware-vmx.exe", vmware_rss_mib * MIB, cmdline=vmx_cmdline, pid=4242),
         FakeProc("vmware.exe", 55 * MIB),
         FakeProc("explorer.exe", 120 * MIB),
     ]
@@ -383,6 +411,83 @@ def test_vm_memory_exposes_configured_and_resident(
     assert vm["configured_gib"] == pytest.approx(2.93, abs=0.01)
     assert result["vmware"]["vmware_vmx_rss_gib"] == pytest.approx(6.64, abs=0.01)
     assert result["vmware"]["vmware_vmx_rss_gib"] > vm["configured_gib"]
+
+
+def test_rss_is_attributed_to_the_vm_that_owns_the_process(
+    lab: dict[str, Any], vmrun: Callable[..., FakeVmrun], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gap this closes: "all VMs hold 6.6 GiB" becomes "this VM holds 6.6".
+
+    The aggregate and the per-VM figure are the same measurement seen two ways,
+    so they must agree here, where exactly one VM is running.
+    """
+    fake_psutil(monkeypatch, vmware_rss_mib=6800, vmware_vmx=lab["running_vmx"])
+    vmrun(list_result=type(
+        "R", (), {"ok": True, "stdout": f"Total running VMs: 1\r\n{lab['running_vmx']}\r\n",
+                  "exit_code": 0}
+    )())
+
+    result = call(server.host_resources)
+
+    vm = result["vm_memory"][0]
+    assert vm["rss_gib"] == pytest.approx(6.64, abs=0.01)
+    assert vm["rss_gib"] == pytest.approx(result["vmware"]["vmware_vmx_rss_gib"], abs=0.01)
+
+
+def test_running_vm_with_no_matching_process_reports_null_rss(
+    lab: dict[str, Any], vmrun: Callable[..., FakeVmrun], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """vmrun says it runs, but no host process owns it: null, never 0.
+
+    0 would read as "running and holding nothing", which is a claim; null is
+    "not measured", which is the truth. The aggregate is unaffected -- the
+    process is still counted there -- so the two can legitimately disagree.
+    """
+    fake_psutil(monkeypatch)  # no vmware_vmx: the process carries no .vmx
+    vmrun(list_result=type(
+        "R", (), {"ok": True, "stdout": f"Total running VMs: 1\r\n{lab['running_vmx']}\r\n",
+                  "exit_code": 0}
+    )())
+
+    result = call(server.host_resources)
+
+    assert result["vm_memory"][0]["rss_gib"] is None
+    assert result["vmware"]["vmware_vmx_rss_gib"] == pytest.approx(6.64, abs=0.01)
+
+
+def test_rss_attribution_ignores_path_case_and_slash_direction(
+    lab: dict[str, Any], vmrun: Callable[..., FakeVmrun], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The .vmx on the command line matches the registry despite cosmetic drift."""
+    drifted = lab["running_vmx"].upper().replace("\\", "/")
+    fake_psutil(monkeypatch, vmware_vmx=drifted)
+    vmrun(list_result=type(
+        "R", (), {"ok": True, "stdout": f"Total running VMs: 1\r\n{lab['running_vmx']}\r\n",
+                  "exit_code": 0}
+    )())
+
+    result = call(server.host_resources)
+
+    assert result["vm_memory"][0]["rss_gib"] == pytest.approx(6.64, abs=0.01)
+
+
+def test_vmx_is_read_from_the_end_of_the_command_line() -> None:
+    """The flags before the path never end in .vmx, so the last such token wins."""
+    cmd = [
+        r"C:\Program Files (x86)\VMware\VMware Workstation\x64\vmware-vmx.exe",
+        "-s", "vmx.stdio.keep=TRUE",
+        "-#", "product=1;name=VMware Workstation;version=17.5.2;",
+        "-@", r"pipe=\\.\pipe\vmxdeadbeef;msgs=ui",
+        r"C:\Users\Zver\Documents\Virtual Machines\wazuh-4.7.5\wazuh-4.7.5.vmx",
+    ]
+
+    assert hostinfo._vmx_path_from_cmdline(cmd) == (
+        r"C:\Users\Zver\Documents\Virtual Machines\wazuh-4.7.5\wazuh-4.7.5.vmx"
+    )
+    # A process that is not running a VM, or whose line we cannot parse, yields
+    # None rather than a guess.
+    assert hostinfo._vmx_path_from_cmdline([r"C:\...\vmware-vmx.exe", "-s", "x=1"]) is None
+    assert hostinfo._vmx_path_from_cmdline([]) is None
 
 
 def test_withholds_vm_memory_and_headroom_when_vmrun_unreachable(

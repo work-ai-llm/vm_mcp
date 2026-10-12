@@ -431,11 +431,12 @@ async def host_resources() -> dict[str, Any]:
               volume that cannot be read carries `error` instead of numbers and
               does not affect the others.
           vmware: Resident memory of VMware's host processes right now, summed
-              across every VM, largest first. Aggregate only -- it is not broken
-              down per VM.
+              across every VM, largest first. This is the aggregate; `vm_memory`
+              carries the per-VM split.
           vm_memory: Per-VM breakdown for running VMs only -- `configured_gib`
-              from its `.vmx`. A stopped VM is absent rather than reported as
-              zero.
+              from its `.vmx` against `rss_gib` measured from its host process.
+              A stopped VM is absent rather than reported as zero, and `rss_gib`
+              is null rather than 0 when no host process could be matched to it.
           headroom_gib: Host available memory minus the configured memory of
               running VMs. Raw subtraction, and the reason this exists.
           uptime: Boot time, uptime in hours, and the host name.
@@ -447,9 +448,18 @@ async def host_resources() -> dict[str, Any]:
         rather than the amount of RAM -- and that overhead is not observable from
         outside the hypervisor. A positive `headroom_gib` therefore does **not**
         mean another VM will fit. A negative one does mean the configured
-        allocations already exceed available memory. What a VM actually holds on
-        the host is only visible in aggregate, as `vmware`, and cannot be
-        attributed to individual VMs from here.
+        allocations already exceed available memory. Its counterpart is
+        `rss_gib`: what each VM actually holds on the host right now, which is
+        what a VM costs and can sit well below, or above, its `configured_gib`.
+
+    Note:
+        `rss_gib` is a host-side measurement, not guest health. It includes
+        VMware's per-VM overhead and moves as VMware balloons, pins or pages the
+        guest out, so a VM holding far less than its `configured_gib` is not
+        thereby a healthy guest -- a guest can be out of memory inside while
+        costing the host almost nothing. Guest truth needs guest-side data, which
+        is M2's `guest_health`. Read `rss_gib` as "what this VM costs the host
+        right now", never as "how the guest is doing".
 
     Note:
         `load_percent` is absent-as-null when the sample window caught no CPU
@@ -464,9 +474,18 @@ async def host_resources() -> dict[str, Any]:
     memory = hostinfo.host_memory()
     vmware = hostinfo.vmware_process_memory()
 
-    # Which VMs are running, and what each is configured to use. Both are needed
-    # for the headroom figure and neither can come from vmware_process_memory:
-    # that sums RSS across processes with no mapping back to a VM.
+    # RSS per running VM, keyed by the .vmx VMware was launched with. This is the
+    # attribution `vmware_process_memory` deliberately does not do: it is a
+    # different question (what one VM holds) from the aggregate (what all of them
+    # hold), and the two are reported separately rather than derived from one
+    # another.
+    resident = {
+        _norm_path(proc["vmx"]): proc["rss_bytes"]
+        for proc in hostinfo.vmware_vmx_processes()
+    }
+
+    # Which VMs are running, and what each is configured to use. The configured
+    # total feeds the headroom figure; the resident map above feeds rss_gib.
     snapshot = roster.registry()
     states, vmrun_error = await _power_states(snapshot.vms)
 
@@ -481,16 +500,28 @@ async def host_resources() -> dict[str, Any]:
         fields = _read_vmx_fields(vm.vmx)
         raw = fields.get("memsize")
         configured = int(raw) if raw and raw.isdigit() else None
+        # Null, not zero, when no host process was found: a VM that vmrun calls
+        # running but which has no attributable vmware-vmx is "not measured",
+        # and 0 would read as "running and holding nothing".
+        rss_bytes = resident.get(_norm_path(vm.vmx))
         entry: dict[str, Any] = {
             "name": vm.name,
             "uuid": vm.uuid,
             "configured_gib": round(configured / 1024, 2) if configured else None,
+            "rss_gib": round(rss_bytes / hostinfo.GIB, 3) if rss_bytes is not None else None,
         }
         if configured:
             configured_total += configured
         per_vm.append(entry)
 
-    per_vm.sort(key=lambda v: v["configured_gib"] or 0, reverse=True)
+    # Sort by what the VM actually holds, falling back to its ceiling when the
+    # resident figure is unknown. Sorting by configured would put a VM that is
+    # configured large but sitting near idle above the actual memory hog, which
+    # is the opposite of what a caller worrying about contention wants first.
+    per_vm.sort(
+        key=lambda v: v["rss_gib"] if v["rss_gib"] is not None else (v["configured_gib"] or 0),
+        reverse=True,
+    )
 
     # memsize is in MiB; hostinfo.GIB is bytes-per-GiB. Both sides are converted
     # from raw units rather than from the already-rounded gib fields above, so a

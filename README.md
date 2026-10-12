@@ -22,34 +22,50 @@ allowlist that has to gate it is [#15](https://github.com/work-ai-llm/vm_mcp/iss
 |---|---|---|
 | `list_vms` | read-only | The lab roster and each VM's power state. |
 | `vm_status` | read-only | One VM's power state, vCPU, RAM, guest OS, VMware Tools state. |
-| `host_resources` | read-only | Measured host CPU, RAM and disk, plus per-VM RAM headroom. |
+| `host_resources` | read-only | Measured host CPU, RAM and disk, plus per-VM resident memory and headroom. |
 | `guest_health` | read-only | Liveness ladder. Distinguishes `up` / `degraded` / `down` / `unknown` and reports how far up the ladder it got. |
 | `start_vm` | mutating | Power on, optionally waiting for the guest to become ready. |
 | `stop_vm` | mutating | Power off. Graceful by default; hard-off is opt-in. |
 | `restart_vm` | mutating | Stop then start a single VM. |
 
-### `host_resources` reports headroom, and refuses to judge it
+### `host_resources` attributes memory, and refuses to judge it
 
 The tool returns `headroom_gib` — host available memory minus the *configured*
-memory of running VMs — and that is the whole of its opinion. There is no
+memory of running VMs — and a per-VM `rss_gib` for each running VM. There is no
 "will another VM fit" field, deliberately, because VMware's per-VM overhead is
 not observable from outside the hypervisor. It is also per-VM rather than
 per-byte, so it grows with the *count* of VMs and not their size.
 
-Measured on this host while two VMs were running:
+Measured on this host with three VMs running:
 
 ```
-available            6.20 GiB
-configured (running) 5.95 GiB   -> headroom_gib  0.23   (looks fine)
-vmware process RSS   8.95 GiB                        (a VM already outweighs it)
+                            configured    rss_gib
+wazuh-4.7.5                    8.00          7.13
+provider: GOAD-DC01            2.93          4.53   <- resident exceeds its ceiling
+provider: PROVISIONING         1.95          1.10
+                            ---------     --------
+configured total              12.88            --
+resident total                   --         12.77
 ```
 
-A `headroom_gib` of 0.23 does not mean a third VM fits. To judge for real,
-compare each VM's `rss_gib` against its `configured_gib` — that gap is overhead
-already paid for, and both numbers are in the payload.
+`configured_gib` is the ceiling in the VM's `.vmx`; `rss_gib` is what the VM
+actually holds on the host right now. They answer different questions, and
+GOAD-DC01 shows why: with VMware's own per-VM overhead counted, resident can
+exceed the ceiling — and it can also sit far below it when a guest is idle or
+ballooned out. `headroom_gib` subtracts the ceilings, so it is a worst case,
+not a prediction. Every number the alternative would need is in the payload;
+the tool declines to pick between them.
 
-Two smaller behaviours worth knowing:
+`rss_gib` is a host-side figure and says nothing about guest health. A VM far
+below its ceiling may have a guest that is fine, or one that is out of memory
+inside while costing the host nothing. Guest truth needs guest-side data, which
+is M2's `guest_health`.
 
+Smaller behaviours worth knowing:
+
+- `rss_gib` is `null`, never `0`, when no host process can be matched to a
+  running VM. That is "not measured", not "holding nothing", and the aggregate
+  under `vmware` may still count that VM's process.
 - `load_percent` is `null` when the sampling window caught no CPU counter ticks,
   which on Windows is routine at this window length. That is "not measured", not
   zero.

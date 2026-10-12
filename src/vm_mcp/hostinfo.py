@@ -52,6 +52,7 @@ __all__ = [
     "host_volumes",
     "sample_cpu",
     "vmware_process_memory",
+    "vmware_vmx_processes",
 ]
 
 # Long enough to catch several Windows counter ticks, short enough that a tool
@@ -301,6 +302,77 @@ def vmware_process_memory(
         result["inaccessible_processes"] = inaccessible
 
     return result
+
+
+def _vmx_path_from_cmdline(cmdline: list[str] | tuple[str, ...]) -> str | None:
+    """The `.vmx` a `vmware-vmx.exe` host process was launched with.
+
+    `vmware-vmx.exe` is one process per running VM and takes that VM's `.vmx` as
+    its final argument. The flags before it (`-s`, `-#`, `-@`) are key=value or
+    license blobs and none of them ends in `.vmx`, so scanning from the end and
+    taking the first token that does is both sufficient and robust to VMware
+    shuffling the flag order in a future release.
+
+    Returns None when no argument looks like a `.vmx`, which means the process is
+    not a VM host process we can attribute -- not that it has no memory.
+    """
+    for arg in reversed(cmdline):
+        if arg.lower().endswith(".vmx"):
+            return arg
+    return None
+
+
+def vmware_vmx_processes() -> list[dict[str, Any]]:
+    """Resident memory of each *running VM*, one host process apiece.
+
+    This is the attribution `vmware_process_memory` cannot give: by reading the
+    `.vmx` out of each `vmware-vmx.exe` command line, a process is tied back to
+    the VM it is running, so RSS becomes "what wazuh is holding" instead of
+    "what all VMs hold". The caller matches the returned `vmx` against its own
+    registry paths, since normalization lives with the path comparison.
+
+    RSS is a host-side number. It includes VMware's per-VM overhead and moves as
+    VMware balloons or pages the guest, so it answers "what is this VM costing
+    the host" and not "how much RAM does the guest think it has". A guest can sit
+    far below its configured `memsize` here and still be the host's largest
+    consumer, or vice versa.
+
+    Returns:
+        One entry per attributable VM host process, unordered:
+          pid: The host process id.
+          vmx: The `.vmx` path exactly as it appeared on the command line.
+          rss_bytes: Resident bytes, unrounded, for exact arithmetic.
+          rss_gib: The same figure in GiB, for reading.
+
+    A `vmware-vmx.exe` whose command line carries no `.vmx`, or one that exits
+    mid-iteration, is skipped rather than guessed at.
+    """
+    found: list[dict[str, Any]] = []
+
+    for proc in psutil.process_iter(["name", "memory_info"]):
+        try:
+            name = (proc.info["name"] or "").lower()
+            if name != "vmware-vmx.exe":
+                continue
+            rss = proc.info["memory_info"].rss
+            vmx = _vmx_path_from_cmdline(proc.cmdline())
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            # A VM can be torn down mid-iteration, and reading the command line
+            # of another user's process can be denied. Both are races or policy,
+            # not faults: skip and let the next call see the settled state.
+            continue
+        if vmx is None:
+            continue
+        found.append(
+            {
+                "pid": proc.pid,
+                "vmx": vmx,
+                "rss_bytes": rss,
+                "rss_gib": round(rss / GIB, 3),
+            }
+        )
+
+    return found
 
 
 def host_uptime() -> dict[str, Any]:

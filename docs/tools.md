@@ -234,8 +234,15 @@ boot's ~156s.
 - **One graceful stop per VM at a time.** A second soft stop while one is in
   flight *joins* it instead of spawning a second vmrun process against the
   same guest. The flight is keyed by normalized `.vmx` path and cleared by
-  the reaper's done-callback, so a landed stop answers a repeat with the
-  clean already-off no-op, not a stale `stopping`.
+  the reaper at the moment its vmrun exits, so a landed stop answers a
+  repeat with the clean already-off no-op, not a stale `stopping`.
+- **The flight guards in every direction.** While a shutdown is in flight,
+  `start_vm` and a soft `restart_vm` are refused -- the one confused state
+  the power tools will not create is a machine being told to go down and
+  being told to come up at the same time. The refusal carries the flight's
+  age and waits are stated as `vm_status` `stopped`; `mode: 'hard'` is the
+  override named in the same breath, never refused, so the guard is a
+  direction-sensitive one and never a lockout.
 - **The per-call `detail` is a pointer, not the contract.** It names what
   the agent needs in the moment -- it did not wait, what `waited_s` means
   here, how to confirm -- and the full rationale lives in the tool

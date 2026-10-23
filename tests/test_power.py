@@ -576,6 +576,76 @@ def test_soft_stop_leaves_the_guidance_the_agent_needs(lab, fake_vmrun) -> None:
     )
 
 
+def test_a_second_soft_stop_joins_the_flight_and_spawns_nothing(
+    lab, fake_vmrun
+) -> None:
+    """One guest, at most one graceful stop driving it at a time.
+
+    Two concurrent soft stops -- or an agent retrying while the first request
+    is still being carried out -- used to spawn two vmrun processes aimed at
+    the same guest. The second call now joins the flight instead: same
+    `stopping` shape, no new process, and a detail that says no new request
+    was issued. The wedged-guest harness keeps the guest listed as running so
+    both calls reach the launch path rather than the already-off short-circuit.
+    """
+    harness = fake_vmrun(stop_never_dies=True)
+
+    async def both_calls() -> tuple[Any, Any]:
+        lab["dc01"].running = True
+        first = await server.stop_vm(uuid=DC01_UUID)
+        second = await server.stop_vm(uuid=DC01_UUID)
+        pending = [t for t in power._BACKGROUND if not t.done()]
+        if pending:
+            await asyncio.gather(*pending)
+        return first, second
+
+    first, second = asyncio.run(both_calls())
+
+    stops = [c for c in harness.calls if c[0] == "stop"]
+    assert stops == [["stop", lab["dc01"].path, "soft"]], (
+        f"exactly one vmrun stop must be spawned for two soft calls, got {stops}"
+    )
+    assert first["detail"] != second["detail"], (
+        "the joiner must answer a different question than the initiating stop"
+    )
+    assert second["power_state"] == power.POWER_STOPPING
+    assert second["confirmed"] is False
+    assert "already in flight" in second["detail"].lower(), (
+        "the joiner must say why it issued nothing"
+    )
+    assert "no new" in second["detail"].lower()
+    assert power._SOFT_STOPS_IN_FLIGHT == {}, (
+        "the reaper's done-callback must clear the in-flight registry, or the "
+        "next genuine stop request would join a flight that is over"
+    )
+
+
+def test_the_in_flight_guard_clears_when_the_stop_lands(lab, fake_vmrun) -> None:
+    """The guard is a deduplicator, not a lock.
+
+    After a shutdown has landed -- the drain awaits the reaper, whose
+    done-callback drops the in-flight entry -- the clearance is observable in
+    what a repeat call returns: the clean already-off no-op, not a joiner
+    still reporting last call's `stopping` as if the shutdown were somehow
+    still running. A registry entry that outlived its stop would produce
+    exactly that stale answer.
+    """
+    harness = fake_vmrun()
+
+    call_powered(server.stop_vm, lab, uuid=DC01_UUID)  # spawns once, lands, drains
+    result = call(server.stop_vm, uuid=DC01_UUID)  # no forced `running`: it is off
+
+    stops = [c for c in harness.calls if c[0] == "stop"]
+    assert stops == [["stop", lab["dc01"].path, "soft"]], (
+        f"a landed stop must be one spawn; a repeat finds the VM already off, got {stops}"
+    )
+    assert power._SOFT_STOPS_IN_FLIGHT == {}
+    assert result["power_state"] == power.POWER_STOPPED
+    assert result["confirmed"] is True, (
+        "an already-off VM is a confirmed no-op, not a stale joiner"
+    )
+
+
 def test_stop_of_a_wedged_guest_still_never_escalates(lab, fake_vmrun) -> None:
     """The safety property, unchanged by the redesign.
 
@@ -1013,6 +1083,10 @@ def test_stop_vm_description_carries_the_fire_and_forget_contract() -> None:
     assert "vm_status" in text, "the agent must be pointed at how to confirm"
     assert "not" in text and "wait" in text, "must not imply the call blocks"
     assert "hard" in text, "the escalation must be named as the caller's choice"
+    assert "in flight" in text and "joins" in text, (
+        "must teach that a repeat soft call joins the shutdown in flight "
+        "instead of spawning a second vmrun process"
+    )
 
 
 def test_restart_vm_description_carries_the_handoff_contract() -> None:

@@ -824,7 +824,9 @@ async def stop_vm(
                 can take longer. Confirm the result before acting on the
                 machine: poll vm_status (or list_vms) until `power_state` is
                 `stopped`. Re-reading is free; do not re-issue this tool just
-                to check state.
+                to check state. A second soft call while one is in flight
+                **joins** the first rather than spawning another vmrun
+                process against the same guest.
             `stopped` (hard): power is verifiably off, read back from
                 `vmrun list`. The VM was gone from the hypervisor list when
                 this was confirmed.

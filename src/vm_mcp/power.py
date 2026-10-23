@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -137,6 +138,25 @@ SOFT_STOP_CEILING = STOP_SOFT_TIMEOUT + 60.0
 # collected mid-shutdown. Entries are discarded the moment their task finishes;
 # `stop` adds, the done-callback removes.
 _BACKGROUND: set["asyncio.Task[None]"] = set()
+
+# Graceful shutdowns already requested by someone, keyed by normalized `.vmx`
+# path. Two concurrent soft stops for one VM would spawn two vmrun processes
+# driving the same guest down -- wasted work at best, an interference risk at
+# worst -- so a second soft stop while one is in flight *joins* it and issues
+# nothing. Entries are cleared by the reaper's done-callback when the stop
+# lands, when it is killed at the ceiling, or when vmrun reports a failure;
+# after that the next soft request is genuinely new and spawns again. The
+# value is the initiating call's outcome, dropped in for whoever joins.
+_SOFT_STOPS_IN_FLIGHT: "dict[str, PowerOutcome]" = {}
+
+# The joiner's detail. Separate from the initiating stop's wording because it
+# answers a different question: not "will you stop my VM" but "did you just
+# start a second stop for my VM".
+_JOIN_DETAIL = (
+    "A graceful shutdown for this VM is already in flight; this call "
+    "issued no new one. Check vm_status: once it reads 'stopped', the VM "
+    "is off."
+)
 
 
 @dataclass(frozen=True)
@@ -529,13 +549,42 @@ async def _initiate_soft_stop(
     did about it is not known until some later observation -- which is why
     `confirmed` is False and `power_state` is `stopping`, a state this module
     commanded rather than one read back from VMware.
+
+    One stop per VM at a time: a second soft stop for a VM whose shutdown is
+    already in flight joins the existing one rather than spawning a second
+    vmrun process against the same guest.
     """
+    key = _norm(vmx_path)
+    if key in _SOFT_STOPS_IN_FLIGHT:
+        return PowerOutcome(
+            power_state=POWER_STOPPING,
+            confirmed=False,
+            waited_s=time.monotonic() - started,
+            vmrun_error=precheck_error,
+            detail=_JOIN_DETAIL,
+        )
+
+    # Claim the slot before the first await. Above the check and the spawn
+    # there is an interleaving window between concurrent calls -- the event
+    # loop can run another coroutine between this function's awaits -- and a
+    # check-then-register placed the wrong way round would let both calls
+    # through. Claiming first makes the window zero wide: at most one call
+    # ever holds a given key. Releasing on a failed spawn keeps a crashed
+    # startup from permanently pinning the VM into "already stopping".
+    _SOFT_STOPS_IN_FLIGHT[key] = PowerOutcome(
+        power_state=POWER_STOPPING, confirmed=False, waited_s=0.0
+    )
     args = ["stop", str(vmx_path), STOP_SOFT]
-    process = await spawn_vmrun(args, executable=executable)
+    try:
+        process = await spawn_vmrun(args, executable=executable)
+    except Exception:
+        _SOFT_STOPS_IN_FLIGHT.pop(key, None)
+        raise
 
     task = asyncio.create_task(_reap_background_stop(process, args))
     _BACKGROUND.add(task)
     task.add_done_callback(_BACKGROUND.discard)
+    task.add_done_callback(lambda _t, _key=key: _SOFT_STOPS_IN_FLIGHT.pop(_key, None))
 
     return PowerOutcome(
         power_state=POWER_STOPPING,

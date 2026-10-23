@@ -21,7 +21,7 @@ between an agent deciding to stop a domain controller and the machine going down
 the committed `tools` allowlist is the control and the only one. Enabling one is a
 deliberate edit to that file.
 
-The test suite never touches VMware: 177 tests pass with no VMware process started
+The test suite never touches VMware: 181 tests pass with no VMware process started
 (the suite includes the M1 host and CLI tests from `main`). The three power tools
 were additionally verified against a real VM — `PROVISIONING`, the Linux jumpbox —
 for start, graceful stop, hard stop, restart, and idempotence, with the lab left

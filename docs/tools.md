@@ -243,6 +243,14 @@ boot's ~156s.
   age and waits are stated as `vm_status` `stopped`; `mode: 'hard'` is the
   override named in the same breath, never refused, so the guard is a
   direction-sensitive one and never a lockout.
+- **The flight claims at entry, before the pre-check.** A start handler in
+  the same batch would otherwise read a clear registry inside the ~0.9s
+  `is_running` window -- and a start accepted mid-shutdown was observed on
+  this host to be queued by VMware and to materialize 70s after the guest
+  had exited: a deferred power-on no call asked for, reported as two clean
+  successes. The claim is synchronous against every other handler's read,
+  released where its rationale ends (machine already off, spawn failed,
+  hard concluded), and the reaper releases what its own vmrun keeps alive.
 - **The per-call `detail` is a pointer, not the contract.** It names what
   the agent needs in the moment -- it did not wait, what `waited_s` means
   here, how to confirm -- and the full rationale lives in the tool

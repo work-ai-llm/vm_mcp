@@ -11,11 +11,14 @@ Windows domain controller looks like from the outside.
 
 ## Status
 
-**M1 complete: three read-only tools, `list_vms`, `vm_status` and `host_resources`. No mutating tool exists.**
+**M3 added: four read-only tools are shipped, the M1 trio plus `guest_health`, the
+liveness ladder that tells a powered-on guest from one that is actually
+answering. No mutating tool exists.**
 
-Every tool in this repository is read-only. None can change a VM's power
-state, and the test suite never touches VMware — 132 tests pass with no VMware
-process started. The mutating half is deliberately not written yet; the
+Every tool in this repository is read-only. None can change a VM's power state.
+The offline suite still runs with no VMware process started; the `guest_health`
+live test reads the real instrument when a VM happens to be powered on, and
+skips otherwise. The mutating half is deliberately not written yet; the
 allowlist that has to gate it is [#15](https://github.com/work-ai-llm/vm_mcp/issues/15).
 
 | Tool | Kind | Shipped |
@@ -23,7 +26,7 @@ allowlist that has to gate it is [#15](https://github.com/work-ai-llm/vm_mcp/iss
 | `list_vms` | read-only | The lab roster and each VM's power state. |
 | `vm_status` | read-only | One VM's power state, vCPU, RAM, guest OS, VMware Tools state. |
 | `host_resources` | read-only | Measured host CPU, RAM and disk, plus per-VM resident memory and headroom. |
-| `guest_health` | read-only | Liveness ladder. Distinguishes `up` / `degraded` / `down` / `unknown` and reports how far up the ladder it got. |
+| `guest_health` | read-only | The liveness ladder for one VM: powered on, Tools heartbeating, service port answering. Reports the rung it reached. |
 | `start_vm` | mutating | Power on, optionally waiting for the guest to become ready. |
 | `stop_vm` | mutating | Power off. Graceful by default; hard-off is opt-in. |
 | `restart_vm` | mutating | Stop then start a single VM. |

@@ -1,8 +1,8 @@
 # Tools
 
 How each read-only tool behaves and why. The tool names and the one-line
-summaries are in the README; this is the detail. M1 shipped exactly three — no
-mutating tool exists.
+summaries are in the README; this is the detail. Four are shipped — the M1
+trio, plus `guest_health` from M3. No mutating tool exists.
 
 Every tool carries `ToolAnnotations(read_only_hint=True, destructive_hint=False)`
 (the `READ_ONLY` constant), and a test asserts that **every advertised tool** is
@@ -128,11 +128,73 @@ rather than guessing.
 below its ceiling may have a guest that is fine, or one that is out of memory
 inside while costing the host nothing. Guest truth needs guest-side data.
 
+## `guest_health`
+
+Takes one `uuid` or `name` (loose-matched, like `vm_status`), plus an optional
+`port` override. The verdict comes from a four-rung ladder, and the result
+reports the highest rung an observation was made at — not just the verdict
+([#12](https://github.com/work-ai-llm/vm_mcp/issues/12)):
+
+| Rung | Observation | Verdict if it is the ceiling |
+|---|---|---|
+| power | in `vmrun list`? (`down` if not: vmrun answered and said off) | `down` |
+| tools | `checkToolsState == running` — the hypervisor's view of the `vmtoolsd` heartbeat | `degraded` |
+| address | a guest address the host can route to, discovered fresh each call | `degraded` |
+| service | TCP connect to the guest's service port answers | `up` |
+
+The order is by cost, and every rung needs no guest credentials. The
+heartbeating rung is the key one for this lab: it is hypervisor-side, so it
+works for every VM regardless of guest networking, and a frozen guest stops
+reporting `running`.
+
+### What is deliberately *not* a probe
+
+- **ICMP is not used.** Nine minutes of `Test-Connection` loss was recorded
+  against a demonstrably live guest; ping answers firewalls, not liveness. A
+  raw-socket TCP connect was measured at ~90 ms, where
+  `Test-NetConnection` costs 12-14 s per try — the probe is a bare `asyncio`
+  connect with a 2 s ceiling, closed immediately, sending no data.
+- **A guest op is not a readiness gate.** `listProcessesInGuest` answered
+  t+2.4 s into a boot that physically needed 156 s, so a successful vmrun guest
+  call proves nothing. Only the service rung answers `up`.
+- **`getGuestIPAddress` output is a candidate, never a target.** vmrun reported
+  the unroutable static GOAD address `192.168.230.3` for one lab VM and the
+  host-reachable bridged DHCP address (`192.168.0.10`) for another. Every
+  candidate is validated against the host's own on-link subnets first; the
+  rejected ones come back under `rejected_addresses` instead of vanishing.
+
+### Where the reachable address comes from
+
+DHCP makes the bridged address change between boots, so discovery is per call.
+Two credential-free sources, in order: `getGuestIPAddress`, then the Windows
+neighbor cache (`arp -a`) matched by **MAC** — the `.vmx` declares each
+adapter's MAC, so a cache entry naming that MAC is this guest's address. The
+MAC match is what found the bridged address in the lab where vmrun reports
+only the unroutable one, and it is also why discovery is hard to fool: a stale
+entry, if probed, frames land on the VM's own NIC, which drops an IP it does
+not own.
+
+### Defaults, and what each boundary means
+
+- **Ports by guest family:** Windows `3389` then `445` (a closed first port
+  does not end the ladder — a DC with live SMB but no RDP is still up), Linux
+  `22`, macOS `5900`. A family with no entry (and an unclassifiable `.vmx`)
+  makes no probe at all and says so. `port` overrides the defaults.
+- **`unknown` is not `down`.** `down` means VMware was asked and said the VM is
+  off. `unknown` means VMware could not be asked at all; reporting `down`
+  during a host fault would be a confident claim that every DC in the lab is
+  powered off.
+- **`refused` is kept visible.** A RST is the guest's own stack proving it is
+  alive; that gateway answer is a `degraded` with the reason saying so, not an
+  `unknown`.
+
+Verified live against a powered-on GOAD DC from the host: `up`, reached
+`service`, `TCP 3389 answered on 192.168.0.10 in 2 ms`, address via
+`get-guest-ip` — with the same VM's wazuh manager, powered off, answered
+`down` at the power rung in under a second.
+
 ## Not in this milestone
 
-- **`guest_health`** — the liveness ladder. The reason the project exists: it must
-  separate "powered on" from "actually responsive", so a VM that is up but wedged
-  reports `degraded`, not `up`. It is M3.
 - **`start_vm` / `stop_vm` / `restart_vm`** — the mutating half, deliberately
   unwritten. The allowlist that gates it is
   [#15](https://github.com/work-ai-llm/vm_mcp/issues/15), and the mutating tools

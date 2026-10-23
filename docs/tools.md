@@ -212,8 +212,8 @@ Issues `vmrun start <vmx> nogui` and confirms the VM *registered as running*
 by reading `vmrun list` back. It does not wait for the guest to be usable:
 measured on this host, the start command returns in ~2s and the guest needs
 ~156s more before its services answer. `power_state: "running"` means
-powered on, emphatically not ready. An agent wanting readiness polls the
-read-only tools until `guest_health` ships to do it for it.
+powered on, emphatically not ready. `guest_health` does the readiness
+ladder: `up` at the `service` rung is the answer it exists to give.
 
 ### `stop_vm`
 

@@ -30,25 +30,37 @@ This is the same discipline `list_vms` already follows in the opposite direction
 where an unreachable vmrun yields `unknown` rather than `stopped`. Here it stops a
 successful-looking command from being reported as a completed power cycle.
 
-Shutdown timing, and why it is a ladder
----------------------------------------
-Shutdown duration is guest-dependent and genuinely unknown ahead of time: a
-Linux jumpbox is not a Windows domain controller draining Active Directory, and
-nothing in the `.vmx` predicts which is which. Rather than guess a single
-timeout, `stop` polls on an escalating ladder -- 10s, 30s, 60s, 120s -- spending
-almost nothing in the common case (a Linux guest is down at the first poll) while
-still covering a slow Windows shutdown inside a single tool call.
+Shutdown, and why a soft stop does not wait
+-------------------------------------------
+`vmrun stop soft` blocks until the guest has actually shut down -- measured
+26.3s on the Ubuntu jumpbox, 61s on a busier one -- and the duration is
+guest-dependent and unknowable in advance: a Linux jumpbox is not a Windows
+domain controller draining Active Directory, and nothing in the `.vmx`
+predicts which is which.
 
-The ladder is a *ceiling on patience*, not a plan to escalate. When it is
-exhausted the VM is still running and the answer says so, along with the
-recommendation to retry with `hard`. This code never escalates to a hard power
-cut on its own: a graceful shutdown failing is a reason to report, not a reason
-to pull the plug on a machine the caller did not ask us to unplug.
+An earlier build held the tool call open and polled `vmrun list` on an
+escalating ladder -- 10s, 30s, 60s, 120s -- so it could report the finished
+outcome. That was cut for a reason measured rather than assumed: the client
+enforces a per-server **request timeout** (`timeout` in `opencode.jsonc`,
+15000 ms here), and the deadline sits on the response, not on idleness. A
+graceful stop can outlive it no matter how the inside of the call spends the
+time -- a direct probe killed a 12s tool call at a 5s client timeout while
+progress notifications were arriving every second. Waiting inside the call
+buys a report the caller has already abandoned.
 
-`hard` is never used as a fallback, deliberately. Escalating silently would make
-`stop_vm` a destructive tool wearing the name of a polite one, and the filesystem
-damage risk of an unclean shutdown is exactly the thing a caller should decide
-about rather than inherit.
+So the soft path is issue-and-return, mirroring what `start_vm` already does
+with the ~156s boot: the shutdown is requested, `vmrun` itself blocks on the
+guest until it finishes, the result reports `stopping` immediately, and the
+agent observes the outcome with the read-only tools instead. The spawned
+vmrun is not abandoned -- a background task owns it until it exits or hits
+the ceiling, after which it is killed rather than left holding the VM.
+
+`hard` is never used as a fallback, deliberately. A graceful shutdown that
+has not landed is reported, not escalated: silently pulling the plug would
+make `stop_vm` a destructive tool wearing the name of a polite one, and the
+filesystem damage risk of an unclean shutdown is exactly the thing a caller
+should decide about rather than inherit. That decision is now the agent's,
+made when it sees a VM still running after a soft request.
 """
 
 from __future__ import annotations
@@ -56,14 +68,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from vm_mcp.vmrun import (
     STOP_HARD,
     STOP_HARD_TIMEOUT,
     STOP_SOFT,
+    STOP_SOFT_TIMEOUT,
     VmrunResult,
     VmrunUnavailable,
     _collect,
@@ -76,6 +88,7 @@ from vm_mcp.vmrun import (
 __all__ = [
     "POWER_RUNNING",
     "POWER_STOPPED",
+    "POWER_STOPPING",
     "POWER_UNKNOWN",
     "PowerOutcome",
     "is_running",
@@ -95,16 +108,12 @@ POWER_STOPPED = "stopped"
 # question about a domain controller's power state.
 POWER_UNKNOWN = "unknown"
 
-# Escalating poll schedule for a graceful stop, in seconds *from the request*.
-#
-# Chosen as a shape rather than as measurements, because the durations are
-# guest-dependent and unmeasurable in advance (see module docstring). The
-# property that matters is that cost tracks the actual wait: a guest that shuts
-# down in 8s costs one 10s poll, while a slow Windows domain controller still
-# gets 220s of patience and is reported on rather than abandoned. Four polls
-# rather than a continuous poll, so an unresponsive guest produces a handful of
-# `vmrun list` calls instead of hundreds.
-SOFT_STOP_LADDER: tuple[int, ...] = (10, 30, 60, 120)
+# A graceful shutdown has been *requested and handed to VMware* -- this is a
+# state this module commanded, not one it observed (it does not come from
+# `vmrun list`), and `confirmed` is False while it holds. The guest may keep
+# running for another minute as it goes down. Only a soft stop produces it;
+# the read-only tools report `running` until the guest finishes leaving.
+POWER_STOPPING = "stopping"
 
 # How long to wait for a VM to appear in `vmrun list` after a start.
 #
@@ -116,22 +125,39 @@ START_SETTLE_TIMEOUT = 15.0
 # How often to re-check `vmrun list` while waiting for the start to register.
 _START_POLL_INTERVAL = 0.5
 
+# Ceiling for a graceful stop running in the background with no call waiting on
+# it, counted against the spawned vmrun itself. VMware does the waiting
+# host-side; this only bounds how long the process may be *owned here* before
+# it is killed. 900s covers a Windows domain controller draining AD -- the
+# thing a soft stop exists to do well -- so a slow-but-real shutdown must not
+# be murdered at 15 seconds' worth of client patience.
+SOFT_STOP_CEILING = STOP_SOFT_TIMEOUT + 60.0
+
+# Live handles for the fire-and-forget reapers, so they cannot be garbage
+# collected mid-shutdown. Entries are discarded the moment their task finishes;
+# `stop` adds, the done-callback removes.
+_BACKGROUND: set["asyncio.Task[None]"] = set()
+
 
 @dataclass(frozen=True)
 class PowerOutcome:
     """What actually happened, as distinct from what was requested.
 
     Attributes:
-        power_state: `running` or `stopped`, **observed** from `vmrun list`.
-            Never inferred from the exit code of the command.
+        power_state: `running` or `stopped`, **observed** from `vmrun list`;
+            `unknown` when nothing can be observed; or, for one case only, a
+            soft stop's `stopping` -- a state this module commanded rather
+            than read back, always paired with `confirmed=False`.
         confirmed: False when the post-condition could not be observed at all --
-            vmrun could not be queried, or the wait ran out. The caller must
-            treat this as "state unknown", not as `power_state`.
+            vmrun could not be queried, the wait ran out, or (soft stop) the
+            observation has deliberately been left to a later, read-only
+            call. The caller must treat this as "state unknown", not as
+            `power_state`.
         waited_s: Seconds spent waiting to observe the post-condition. Reported
             so an agent can reason about cost rather than guess at it.
         vmrun_error: The failure, when there is one.
-        detail: Human-readable note about anything unusual -- a graceful stop
-            that ran out of patience, or a start that did not register.
+        detail: Human-readable note about anything unusual -- a shutdown in
+            flight, or a start that did not register.
     """
 
     power_state: str
@@ -273,30 +299,32 @@ async def stop(
     vmx_path: str | Path,
     *,
     mode: str = STOP_SOFT,
-    ladder: Sequence[int] | None = None,
     executable: Path | None = None,
 ) -> PowerOutcome:
-    """Power off a VM, gracefully by default, and confirm it actually went down.
+    """Power off a VM: gracefully by default, without waiting for the guest.
 
-    `mode="soft"` asks the guest OS to shut itself down and is the default
-    because it lets the filesystem unmount cleanly. `mode="hard"` cuts power.
+    `mode="soft"` asks the guest OS to shut itself down and **returns before
+    the shutdown finishes** -- that is the point, see the module docstring on
+    the client's request timeout. `mode="hard"` cuts power (measured ~1s) and
+    is verified inside the call, because it is fast enough to be.
 
-    Neither mode is escalated to by this function. If a graceful stop runs out of
-    patience the result says the VM is still running and recommends `hard`; it
-    does not pull the plug itself. See the module docstring for why.
+    Neither mode is escalated to by this function. A soft shutdown that has
+    not landed is the caller's to observe with the read-only tools, and hard
+    is the caller's deliberate second call.
 
     Args:
         vmx_path: Absolute path to the VM's `.vmx`.
         mode: `soft` (default) or `hard`.
-        ladder: Cumulative seconds at which to check whether the VM is down.
-            Only consulted for a graceful stop. Defaults to `SOFT_STOP_LADDER`,
-            resolved at call time rather than as a default argument so that
-            overriding the module constant actually takes effect.
         executable: Override the vmrun binary path. Tests use this.
 
     Returns:
-        A PowerOutcome. For a graceful stop that timed out, `power_state` is
-        `running` and `detail` explains the recommendation.
+        A PowerOutcome whose `power_state` says exactly what was verified:
+
+        * `soft` on a running VM: `stopping`, `confirmed=False` -- a shutdown
+          request is in flight, the call did not wait for it.
+        * `soft` on a VM that was already off: `stopped`, `confirmed=True`.
+        * `hard`: `stopped` confirmed by reading `vmrun list`, `running` if
+          the VM is inexplicably still up, or `unknown`.
 
     Raises:
         VmrunUnavailable: The stop command itself could not be issued.
@@ -304,9 +332,6 @@ async def stop(
     """
     if mode not in (STOP_SOFT, STOP_HARD):
         raise ValueError(f"stop mode must be {STOP_SOFT!r} or {STOP_HARD!r}, not {mode!r}")
-
-    if ladder is None:
-        ladder = SOFT_STOP_LADDER
 
     started = time.monotonic()
 
@@ -323,23 +348,22 @@ async def stop(
             waited_s=time.monotonic() - started,
             detail="the VM was already powered off; nothing to stop.",
         )
-    if running is None:
-        # Cannot see the VM. Proceed anyway: the stop is the caller's request, and
-        # a host fault must not turn "stop this VM" into a silent no-op that
-        # reports success without having checked anything.
-        logger.warning(
-            "stop: could not read power state before stopping (%s); proceeding",
-            error,
-        )
 
     if mode == STOP_HARD:
+        # Unobservable state also proceeds here, as it always has: hard is
+        # fast, and the outcome below is observed whatever the pre-check saw.
         return await _stop_and_confirm_hard(vmx_path, started, executable=executable)
 
-    # The graceful path is self-contained: `_stop_soft` walks the ladder while the
-    # blocking command runs and returns the finished outcome, including what to do
-    # if patience ran out. There is nothing left to confirm afterwards, and asking
-    # again would double the cost of the common case for no new information.
-    return await _stop_soft(vmx_path, ladder=ladder, executable=executable)
+    # The VM is -- as far as anything can be seen -- powered on. Hand the
+    # graceful shutdown to VMware and answer immediately; even when the
+    # pre-check was blind (running is None, vmrun list itself failed), the
+    # request is still issued, because a host fault must not silently turn
+    # "stop this VM" into a no-op that reports success without checking. The
+    # result carries `confirmed=False` either way: nothing here has seen the
+    # guest go down.
+    return await _initiate_soft_stop(
+        vmx_path, started, precheck_error=error, executable=executable
+    )
 
 
 async def _stop_and_confirm_hard(
@@ -407,135 +431,159 @@ async def restart(
     *,
     mode: str = STOP_SOFT,
     executable: Path | None = None,
-) -> tuple[PowerOutcome, PowerOutcome]:
-    """Stop a VM, then power it back on.
+) -> tuple[PowerOutcome, PowerOutcome | None]:
+    """Stop a VM, then power it back on -- or hand the start back to the caller.
 
     Both halves report independently, and a stop that only partly worked is not
-    papered over by a successful start. `restart` is two operations wearing one
-    name; collapsing their outcomes into a single verdict would hide exactly the
-    case where a VM was asked to restart and came back up without having cleanly
-    stopped -- which is the case where a domain controller is holding stale
-    state.
+    papered over by a successful start. See the docstring on `stop`: a soft
+    shutdown runs in the background now, so `restart` with `mode="soft"` cannot
+    confirm the VM is down inside its own call -- and starting a VM that is
+    still shutting down is precisely the confused state this module refuses to
+    create.
 
     Args:
         vmx_path: Absolute path to the VM's `.vmx`.
         mode: Stop mode, as for `stop`.
 
     Returns:
-        `(stop_outcome, start_outcome)`.
+        `(stop_outcome, start_outcome)`, with `start_outcome` **None when there
+        is no start to reports yet**:
+
+        * VM found already powered off: no stop is issued, the start runs
+          immediately (it is fast), and both halves are returned whole.
+        * `mode="hard"` with a confirmed stop: the full cycle inside the call,
+          both halves returned whole.
+        * `mode="soft"` on a running VM: the shutdown is now in flight; the
+          start is deliberately left to the caller, who issues `start_vm` once
+          the read-only tools show stopped. Nothing here outruns the shutdown
+          it just asked for.
+        * `mode="hard"` whose stop did not confirm: the refusal outcome below
+          rather than a start over a possibly-running machine.
 
     Raises:
         VmrunUnavailable: A command could not be issued.
         ValueError: `mode` is invalid.
     """
-    stopped = await stop(vmx_path, mode=mode, executable=executable)
-
-    # Do not power on a VM that is still running: that would turn a failed stop
-    # into a confused double-boot rather than reporting the failure.
-    if stopped.power_state != POWER_STOPPED:
-        return stopped, PowerOutcome(
-            power_state=stopped.power_state,
-            confirmed=False,
-            waited_s=0.0,
-            detail=(
-                "the VM was not confirmed stopped, so it was not started again. "
-                "A restart requires a clean stop first; forcing power on over a "
-                "running VM would produce a machine that looks up and is not."
-            ),
+    if mode not in (STOP_SOFT, STOP_HARD):
+        raise ValueError(
+            f"restart mode must be {STOP_SOFT!r} or {STOP_HARD!r}, not {mode!r}"
         )
 
-    started = await start(vmx_path, executable=executable)
-    return stopped, started
+    stopped = await stop(vmx_path, mode=mode, executable=executable)
+
+    if stopped.confirmed and stopped.power_state == POWER_STOPPED:
+        # A confirmed stop means the VM is down *right now* -- which, before
+        # any soft stop was issued, is exactly the "already off" case. The
+        # restart completes here and cheaply.
+        return stopped, await start(vmx_path, executable=executable)
+
+    if mode == STOP_SOFT:
+        # A graceful shutdown is in flight in the background. The caller
+        # finishes the restart: poll vm_status until 'stopped', then start_vm.
+        note = (
+            "This is half a restart: the shutdown was issued but not waited "
+            "for. When vm_status shows the VM 'stopped' -- typically 30-90s "
+            "-- call start_vm to bring it back up."
+        )
+        detail = f"{stopped.detail} {note}" if stopped.detail else note
+        return replace(stopped, detail=detail), None
+
+    # `hard`: the stop ran, blocked, and did not come back confirmed. Refuse
+    # the start rather than power on over a machine that may still be running:
+    # a double-boot is not a restart, and no report says when it is safe.
+    refusal = PowerOutcome(
+        power_state=stopped.power_state,
+        confirmed=False,
+        waited_s=0.0,
+        detail=(
+            "the VM was not confirmed stopped, so it was not started again. "
+            "A restart requires a clean stop first; forcing power on over a "
+            "running VM would produce a machine that looks up and is not."
+        ),
+    )
+    return stopped, refusal
 
 
 # --- graceful stop internals ----------------------------------------------
 
 
-async def _stop_soft(
+async def _initiate_soft_stop(
     vmx_path: str | Path,
+    started: float,
     *,
-    ladder: Sequence[int] | None = None,
+    precheck_error: str | None = None,
     executable: Path | None = None,
 ) -> PowerOutcome:
-    """Run a graceful stop while polling `vmrun list` alongside it.
+    """Issue `vmrun stop <vmx> soft` and answer before the guest obeys.
 
-    `vmrun stop soft` blocks until the guest has shut down (measured 26.3s on this
-    host), so it is **spawned rather than awaited**. Polling has to happen
-    concurrently: awaiting the command first would mean no observation is possible
-    until the answer is already known, and the ladder would be dead code.
+    `vmrun stop soft` blocks until the guest has shut down (measured 26.3s on
+    this host, 61s on a busier one), so the command is handed to a background
+    task that owns it -- `_collect` reads its pipes so they cannot fill (see
+    the note in `vmrun.py`), `vmrun` itself drives the guest to shutdown, and
+    if the stop outlives `SOFT_STOP_CEILING` the process is killed rather than
+    left holding the VM in a half-commanded state.
 
-    The process is always reaped. On the timeout path it is killed rather than
-    left running, so a stop that outlives its patience does not leave a vmrun
-    holding the VM in the background after the tool has returned.
+    The tool call returns the moment the request is in flight. What the guest
+    did about it is not known until some later observation -- which is why
+    `confirmed` is False and `power_state` is `stopping`, a state this module
+    commanded rather than one read back from VMware.
     """
-    started = time.monotonic()
+    args = ["stop", str(vmx_path), STOP_SOFT]
+    process = await spawn_vmrun(args, executable=executable)
 
-    if ladder is None:
-        ladder = SOFT_STOP_LADDER
+    task = asyncio.create_task(_reap_background_stop(process, args))
+    _BACKGROUND.add(task)
+    task.add_done_callback(_BACKGROUND.discard)
 
-    process = await spawn_vmrun(
-        ["stop", str(vmx_path), STOP_SOFT], executable=executable
+    return PowerOutcome(
+        power_state=POWER_STOPPING,
+        confirmed=False,
+        waited_s=time.monotonic() - started,
+        vmrun_error=precheck_error,
+        detail=(
+            "a graceful shutdown was requested from VMware and is being "
+            "carried out in the background; this call did NOT wait for it. "
+            "Shutting down typically takes 30-90s on this lab (measured "
+            "26-61s) and a busy Windows guest can take longer. Confirm before "
+            "acting on the machine: poll vm_status (or list_vms) until "
+            "power_state is 'stopped'. Do not call stop_vm again just to "
+            "check state -- re-reading is free, re-issuing is not. If the VM "
+            "is still running several minutes after this request and you "
+            "intend it off, mode='hard' cuts power at once; that risks guest "
+            "filesystem damage, so it is never automatic."
+        ),
     )
 
-    deadline_total = float(sum(ladder)) if ladder else 0.0
-    # The command's own ceiling, kept separate from the ladder's: whichever is
-    # longer governs. vmrun exiting non-zero is surfaced, not swallowed.
-    command_task = asyncio.ensure_future(
-        _collect(process, ["stop", str(vmx_path), STOP_SOFT], deadline_total + 60.0)
-    )
 
-    elapsed = 0.0
+async def _reap_background_stop(
+    process: "asyncio.subprocess.Process",
+    args: list[str],
+) -> None:
+    """Own a fire-and-forget graceful stop once the tool call has returned.
+
+    Nobody is awaiting this process, but it must not be abandoned: its stdout
+    and stderr pipes need draining (a full pipe buffer can wedge a child on
+    Windows), and the outcome is worth a log line because it is not observable
+    in any result the caller received. On `SOFT_STOP_CEILING` the process is
+    killed -- a stop that outlives it is the guest refusing shutdown, which
+    the agent discovers through vm_status and answers with `hard` if it wants.
+    """
+    vmx = args[1]
     try:
-        for checkpoint in ladder:
-            await asyncio.sleep(max(0.0, checkpoint - elapsed))
-            elapsed = time.monotonic() - started
+        result = await _collect(process, args, SOFT_STOP_CEILING)
+    except VmrunUnavailable as exc:
+        logger.warning("background graceful stop for %s lost contact: %s", vmx, exc)
+        return
 
-            running, error = await is_running(vmx_path, executable=executable)
-
-            if running is False:
-                # The post-condition is satisfied. Reap the command so the stop
-                # result is reported rather than abandoned mid-flight.
-                return await _finish(command_task, process, PowerOutcome(
-                    power_state=POWER_STOPPED,
-                    confirmed=True,
-                    waited_s=time.monotonic() - started,
-                ))
-
-            if running is None:
-                # vmrun is unreachable while a shutdown is in progress. That is
-                # more likely a host fault than a VM problem, and it must not be
-                # reported as either.
-                return PowerOutcome(
-                    power_state=POWER_UNKNOWN,
-                    confirmed=False,
-                    waited_s=time.monotonic() - started,
-                    vmrun_error=error,
-                    detail=(
-                        "the graceful stop was issued but vmrun could not be "
-                        "queried to confirm it. The VM's state is unknown; "
-                        "re-check with vm_status."
-                    ),
-                )
-
-        # Ladder exhausted. The VM is still running, which is a real answer.
-        return await _finish(command_task, process, PowerOutcome(
-            power_state=POWER_RUNNING,
-            confirmed=True,
-            waited_s=time.monotonic() - started,
-            detail=(
-                f"still running {deadline_total:.0f}s after a graceful shutdown "
-                "request, so the guest has not completed it. This often means a "
-                "shutdown is waiting on something -- a prompt, a hung service, "
-                "or a filesystem that will not flush. The VM is up and "
-                "reachable as it was. Retry with mode='hard' to cut power; that "
-                "risks guest filesystem damage, so it is left to the caller to "
-                "choose."
-            ),
-        ))
-    finally:
-        if not command_task.done():
-            command_task.cancel()
-            await _reap(process)
+    if result.ok:
+        logger.info("background graceful stop for %s finished (exit 0)", vmx)
+    else:
+        logger.warning(
+            "background graceful stop for %s exited %s: %s",
+            vmx,
+            result.exit_code,
+            _describe(result),
+        )
 
 
 async def _stop_hard(
@@ -547,62 +595,6 @@ async def _stop_hard(
         timeout=STOP_HARD_TIMEOUT,
         executable=executable,
     )
-
-
-async def _finish(
-    task: "asyncio.Future[VmrunResult]",
-    process: "asyncio.subprocess.Process",
-    outcome: PowerOutcome,
-) -> PowerOutcome:
-    """Reap a spawned stop command and fold its exit code into `outcome`.
-
-    The observation is authoritative and already decided by the time this runs;
-    the command's exit code can only add information, never overturn it. A
-    non-zero exit *after* the VM was observed going down is therefore reported as
-    a detail rather than as a failure -- the machine is off, and saying so would
-    be a lie about the only fact that matters here.
-    """
-    try:
-        result = await asyncio.wait_for(task, timeout=30.0)
-    except (asyncio.TimeoutError, asyncio.CancelledError):
-        await _reap(process)
-        return outcome
-
-    if result.ok:
-        return outcome
-
-    # `outcome.detail` is optional, and the ladder-exhausted path is the one that
-    # sets it. Interpolating a missing detail produced a literal "None Note: ..."
-    # in a result an agent has to read, which is worse than no note at all.
-    note = (
-        "vmrun itself exited non-zero while this was happening; the power state "
-        "above was still read back from VMware."
-    )
-    detail = f"{outcome.detail} {note}" if outcome.detail else note
-
-    return PowerOutcome(
-        power_state=outcome.power_state,
-        confirmed=outcome.confirmed,
-        waited_s=outcome.waited_s,
-        vmrun_error=_describe(result),
-        detail=detail,
-    )
-
-
-async def _reap(process: "asyncio.subprocess.Process") -> None:
-    """Kill a spawned vmrun if it is still running, and wait for it to go.
-
-    Leaving a vmrun behind holding a VM after the tool has returned is the failure
-    this exists to prevent: the caller is told the stop timed out, retries, and
-    now two processes are contending for one VM.
-    """
-    if process.returncode is not None:
-        return
-    try:
-        process.kill()
-        await process.wait()
-    except (ProcessLookupError, asyncio.CancelledError):
-        pass
 
 
 # --- polling helpers ------------------------------------------------------

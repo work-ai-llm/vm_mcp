@@ -126,9 +126,12 @@ mcp = MCPServer(
         "answering, and host_resources to see what the VMs cost the host. "
         "start_vm, stop_vm and restart_vm change power state; they act on a "
         "single VM named or uuid'd by the caller, never on a path, and never on "
-        "more than one machine. A start or restart reports a VM as powered on "
-        "well before its guest is usable -- expect roughly 150s more -- so do not "
-        "treat 'running' as 'ready'."
+        "more than one machine. A start reports a VM as powered on well before "
+        "its guest is usable -- expect roughly 150s more -- so do not treat "
+        "'running' as 'ready'. A soft stop_vm and a soft restart_vm return "
+        "power_state 'stopping' as soon as the shutdown is in flight and do "
+        "not wait for it; confirm the shutdown with the read-only tools "
+        "before treating the machine as off, never by re-issuing the stop."
     ),
 )
 
@@ -772,7 +775,7 @@ async def stop_vm(
     name: str | None = None,
     mode: str = STOP_SOFT,
 ) -> dict[str, Any]:
-    """Power off one VM, gracefully by default, and confirm it went down.
+    """Request a power-off of one VM. Soft returns at once; hard cuts power.
 
     Identifies the VM by `uuid` (preferred) or `name` and resolves it against the
     VMware registry.
@@ -781,33 +784,42 @@ async def stop_vm(
         uuid: The VM's hardware UUID, as reported by `list_vms`.
         name: Name or label of the VM.
         mode: `soft` (default) asks the guest OS to shut itself down, letting it
-            unmount filesystems cleanly. `hard` cuts power immediately, the
+            unmount filesystems cleanly, and **returns before the shutdown
+            finishes** -- see Returns. `hard` cuts power immediately, the
             equivalent of pulling the plug.
 
     Returns:
         A dict with:
           name, uuid, vmx: the VM that was acted on.
           mode: the mode actually used.
-          power_state: `stopped`, `running`, or `unknown`, read back from
-              `vmrun list` rather than from the stop command's exit code.
-          confirmed: True only if that read-back happened.
-          waited_s: How long the wait took.
-          detail: Present when there is something to act on -- typically a
-              graceful stop that ran out of patience, or a start whose exit code
-              and the hypervisor disagreed.
+          power_state:
+            `stopping` (soft): a graceful shutdown was requested and is being
+                carried out in the background. This is NOT an observed state
+                and `confirmed` is False. Shutting down typically takes
+                30-90s on this lab (measured 26-61s) and a busy Windows guest
+                can take longer. Confirm the result before acting on the
+                machine: poll vm_status (or list_vms) until `power_state` is
+                `stopped`. Re-reading is free; do not re-issue this tool just
+                to check state.
+            `stopped` (hard): power is verifiably off, read back from
+                `vmrun list`. The VM was gone from the hypervisor list when
+                this was confirmed.
+          confirmed: True only when the state above was actually observed.
+          waited_s: How long the call itself waited (small always; a soft
+              stop does NOT block on the guest).
+          detail: Present when there is something to act on or to wait out.
 
-        **A graceful stop that does not finish is reported, not escalated.**
-        Shutdown time depends on the guest and cannot be predicted, so this tool
-        polls on an escalating schedule (10s, 30s, 60s, 120s) while the shutdown
-        runs. If the VM is still up when that is exhausted, the result says so and
-        recommends `mode='hard'` -- it will not pull the plug on its own, because
-        the filesystem risk of an unclean shutdown is the caller's to accept.
+        If the VM is still running several minutes after a soft request and
+        you intend it off, that guest has not shut down -- re-issuing soft
+        will not speed that up. `mode: "hard"` cuts power at once; it risks
+        guest filesystem damage, so it is never chosen for you: the stop is
+        soft until you deliberately ask for hard.
 
     Note:
         `hard` is destructive and this tool is annotated as such. On a Windows
-        domain controller it risks guest filesystem damage. Prefer `soft` unless
-        the guest is known to be wedged -- which is exactly the situation
-        `guest_health` is for.
+        domain controller it risks guest filesystem damage. Prefer `soft`
+        unless the guest is known to be wedged -- which is exactly the
+        situation `guest_health` is for.
     """
     vm = _resolve_for_power(uuid, name)
     outcome = await power.stop(vm.vmx, mode=mode)
@@ -820,39 +832,49 @@ async def restart_vm(
     name: str | None = None,
     mode: str = STOP_SOFT,
 ) -> dict[str, Any]:
-    """Stop one VM, then power it back on. Reports both halves separately.
+    """Restart one VM: stop, then start. The two halves stay separate.
 
     Identifies the VM by `uuid` (preferred) or `name` and resolves it against the
     VMware registry. Takes the same `mode` as `stop_vm`, applied to the stop.
 
+    Args:
+        uuid: The VM's hardware UUID, as reported by `list_vms`.
+        name: Name or label of the VM.
+        mode: `soft` (default) -- the call issues the graceful shutdown, then
+            hands the start half back to you: poll `vm_status` until the VM
+            shows `stopped` (typically 30-90s), then call start_vm. This is
+            deliberate -- starting a VM that is still shutting down is a state
+            this tool refuses to create, and the client enforces a request
+            timeout that a slow shutdown would blow anyway.
+            `hard` -- fast enough to do the whole cycle in one call: cut
+            power (~2s), power back on (~2-3s), return once powered on is
+            confirmed.
+
     Returns:
         A dict with:
           name, uuid, vmx: the VM that was acted on.
-          stopped: the `stop_vm` result -- `power_state`, `confirmed`, `waited_s`
-              and any `detail`.
-          started: the `start_vm` result, in the same shape.
+          mode: the mode actually used.
+          stopped: the `stop_vm` result (`power_state`, `confirmed`,
+              `waited_s`, any `detail`). With `mode: "soft"` this is
+              `power_state: "stopping"`, `confirmed: false` and a `detail`
+              that tells you to call start_vm when vm_status shows stopped.
+          started: the `start_vm` result -- present when the VM was verified
+              down inside this call (already-off VMs, and confirmed hard
+              restarts). **Absent with a soft shutdown in flight**: that is
+              the handoff, not an omission.
 
-        **The two are reported independently on purpose.** A restart that stops
-        cleanly and starts cleanly is unremarkable; the case worth seeing is a VM
-        that came back up *without having cleanly stopped*, because that machine
-        is running on stale state. A single verdict would hide exactly that.
-
-        If the stop is not confirmed, the start does not happen. `started` then
-        carries `confirmed: False` and an explanation, rather than the tool
-        powering a VM that was still running -- which would leave a machine
-        looking up while two power states disagree.
-
-        As with `start_vm`, `started.power_state == "running"` means powered on,
-        not usable: expect roughly 150s more before the guest answers.
+        When `started` is present, the usual rule applies: `running` means
+        powered on, not usable -- expect roughly 150s more before the guest
+        answers. That half is reported even when the stop was unremarkable,
+        because the case worth seeing is a machine that came back up *without
+        having cleanly stopped* and is running on stale state.
     """
     vm = _resolve_for_power(uuid, name)
     stopped, started = await power.restart(vm.vmx, mode=mode)
-    return {
-        **_identity(vm),
-        "mode": mode,
-        "stopped": stopped.as_dict(),
-        "started": started.as_dict(),
-    }
+    payload = {**_identity(vm), "mode": mode, "stopped": stopped.as_dict()}
+    if started is not None:
+        payload["started"] = started.as_dict()
+    return payload
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

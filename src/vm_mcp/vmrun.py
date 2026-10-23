@@ -149,11 +149,11 @@ async def spawn_vmrun(
 
     The only reason this exists, and the reason it is not the default path: a
     graceful `stop` **blocks until the guest has finished shutting down**
-    (measured 26.3s for the Ubuntu jumpbox). Awaiting it would mean the caller
-    cannot observe the VM's actual power state while the shutdown is in
-    progress, which is precisely the thing worth observing. Spawning lets the
-    poll ladder watch `vmrun list` while the shutdown runs, instead of guessing
-    at the outcome and reporting success for something that may still be going.
+    (measured 26.3s for the Ubuntu jumpbox), and the caller enforces a fixed
+    request timeout that such a wait can outlive by minutes. Awaiting it would
+    spends the caller's budget waiting on the guest instead of answering, so
+    the command is started, handed to a background owner (`power.py` reaps
+    it), and the caller is answered at once.
 
     The caller owns the process and is responsible for consuming it (via
     `_collect`, or by killing it). Nothing here enforces that.

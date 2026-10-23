@@ -14,16 +14,22 @@ Windows domain controller looks like from the outside.
 **M2 complete: four read-only tools and three power-control tools; the power tools ship disabled by default in client config.**
 
 The mutating tools are implemented and tested, but **disabled by default** in
-`opencode.jsonc` and ship gated, not deferred. There is no prompt, no confirmation
-dialog and no second opinion inside the server between an agent deciding to stop a
-domain controller and the machine going down, so the committed `tools` allowlist is the
-control and the only one. Enabling one is a deliberate edit to that file.
+`opencode.jsonc` and ship gated, not deferred. `stop_vm` on a domain controller is not
+the kind of capability that should be one milestone of drift away from being switched
+on. There is no prompt, no confirmation dialog and no second opinion inside the server
+between an agent deciding to stop a domain controller and the machine going down, so
+the committed `tools` allowlist is the control and the only one. Enabling one is a
+deliberate edit to that file.
 
-The test suite never touches VMware: 141 tests pass with no VMware process started. The
-three power tools were additionally verified against a real VM — `PROVISIONING`, the Linux
-jumpbox — for start, graceful stop, hard stop, restart, and idempotence, with the lab left
-powered off and snapshot count unchanged. The `guest_health` live test reads the real
-instrument when a VM happens to be powered on, and skips otherwise.
+The test suite never touches VMware: 163 tests pass with no VMware process started
+(the suite includes the M1 host and CLI tests from `main`). The three power tools
+were additionally verified against a real VM — `PROVISIONING`, the Linux jumpbox —
+for start, graceful stop, hard stop, restart, and idempotence, with the lab left
+powered off and snapshot count unchanged. That live pass was made against the blocking
+build; the fire-and-forget stop is design-verified and test-verified only, and a
+second live run against a real guest is the natural next verification. The
+`guest_health` live test reads the real instrument when a VM happens to be powered
+on, and skips otherwise.
 
 | Tool | Kind | Shipped |
 |---|---|---|
@@ -32,8 +38,8 @@ instrument when a VM happens to be powered on, and skips otherwise.
 | `host_resources` | read-only | Measured host CPU, RAM and disk, plus per-VM resident memory and headroom. |
 | `guest_health` | read-only | The liveness ladder for one VM: powered on, Tools heartbeating, service port answering. Reports the rung it reached. |
 | `start_vm` | mutating | Power on with `nogui`. Confirms powered-on; does **not** wait for the guest. |
-| `stop_vm` | mutating | Power off. Graceful by default; hard-off is opt-in. |
-| `restart_vm` | mutating | Stop then start one VM, reporting both halves separately. |
+| `stop_vm` | mutating | Power off. `soft` (default) issues the shutdown and returns `stopping` at once; `hard` cuts power and returns confirmed. |
+| `restart_vm` | mutating | Stop then start one VM. `hard` completes both halves in the call; `soft` hands the start half back to the agent. |
 
 ## Quick start
 
@@ -62,7 +68,8 @@ The top-level README is the quick start. The reasoning lives in
 - [`docs/architecture.md`](docs/architecture.md) — the long-lived decisions:
   why `vmrun`, the two transports, the SDK pin, the registry, the `vmrun` layer,
   the tool-error contract.
-- [`docs/tools.md`](docs/tools.md) — how each read-only tool behaves and why.
+- [`docs/tools.md`](docs/tools.md) — how each shipped tool behaves and why,
+  including the power tools' contracts.
 - [`docs/usage.md`](docs/usage.md) — running the server, the client config,
   worktrees, transports.
 - [`docs/security.md`](docs/security.md) — the security posture and the real

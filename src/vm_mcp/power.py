@@ -480,10 +480,12 @@ async def restart(
     if mode == STOP_SOFT:
         # A graceful shutdown is in flight in the background. The caller
         # finishes the restart: poll vm_status until 'stopped', then start_vm.
+        # Short by design -- the stop result's detail and the tool's
+        # description already say why; this names only the missing step.
         note = (
-            "This is half a restart: the shutdown was issued but not waited "
-            "for. When vm_status shows the VM 'stopped' -- typically 30-90s "
-            "-- call start_vm to bring it back up."
+            "This is half a restart: the shutdown is in flight. When "
+            "vm_status reads 'stopped' (typically 30-90s), call start_vm "
+            "to finish it."
         )
         detail = f"{stopped.detail} {note}" if stopped.detail else note
         return replace(stopped, detail=detail), None
@@ -541,16 +543,11 @@ async def _initiate_soft_stop(
         waited_s=time.monotonic() - started,
         vmrun_error=precheck_error,
         detail=(
-            "a graceful shutdown was requested from VMware and is being "
-            "carried out in the background; this call did NOT wait for it. "
-            "Shutting down typically takes 30-90s on this lab (measured "
-            "26-61s) and a busy Windows guest can take longer. Confirm before "
-            "acting on the machine: poll vm_status (or list_vms) until "
-            "power_state is 'stopped'. Do not call stop_vm again just to "
-            "check state -- re-reading is free, re-issuing is not. If the VM "
-            "is still running several minutes after this request and you "
-            "intend it off, mode='hard' cuts power at once; that risks guest "
-            "filesystem damage, so it is never automatic."
+            "A graceful shutdown was requested; this call did not wait "
+            "(waited_s is issue time, not shutdown time). Check vm_status: "
+            "'stopped' means done. Still running minutes later? mode='hard' "
+            "is the deliberate follow-up; this tool's description carries "
+            "the full contract."
         ),
     )
 

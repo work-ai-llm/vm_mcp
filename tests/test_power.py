@@ -564,8 +564,16 @@ def test_soft_stop_leaves_the_guidance_the_agent_needs(lab, fake_vmrun) -> None:
 
     detail = result["detail"].lower()
     assert "not" in detail and "wait" in detail, "must admit it did not wait"
+    assert "waited_s" in detail, (
+        "must say what waited_s means here: issue time, not shutdown time"
+    )
     assert "vm_status" in detail, "must say how to confirm"
     assert "hard" in detail, "must name the escalation, purely as an option"
+    assert len(result["detail"]) < 300, (
+        "the detail is a pointer, not the contract: the full guidance lives "
+        "in the tool description, and re-sending it on every call is wall of "
+        "text an agent stops reading"
+    )
 
 
 def test_stop_of_a_wedged_guest_still_never_escalates(lab, fake_vmrun) -> None:
@@ -753,6 +761,11 @@ def test_soft_restart_hands_the_start_back_to_the_caller(lab, fake_vmrun) -> Non
     )
     assert "start_vm" in result["stopped"]["detail"].lower(), (
         "the handoff must name the tool that completes it"
+    )
+    assert len(result["stopped"]["detail"]) < 450, (
+        "the detail is a hint, not the contract: the description carries the "
+        "full handoff rationale, and the per-call text stays short enough to "
+        "actually be read"
     )
     assert not any(c[0] == "start" for c in harness.calls)
 

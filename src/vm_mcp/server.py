@@ -1,8 +1,9 @@
 """vm_mcp — MCP server for a local VMware Workstation lab.
 
-MILESTONE 1: read-only inspection. Three tools are exposed — `list_vms`,
-`vm_status` and `host_resources` — and none of them can change a VM's state.
-Mutating tools land later and are gated on the allowlist design in issue #15.
+MILESTONE 1 + M3: read-only inspection. Four tools are exposed -- `list_vms`,
+`vm_status`, `host_resources` and `guest_health` -- and none of them can change
+a VM's state. Mutating tools land later and are gated on the allowlist design
+in issue #15.
 
 Where the data comes from
 -------------------------
@@ -12,6 +13,9 @@ Where the data comes from
 * *Per-VM configuration* — the VM's own `.vmx` file, parsed read-only.
 * *Host capacity* — `hostinfo.py` reads the host through psutil and starts no
   VMware process at all.
+* *Guest liveness* — `health.py` climbs a four-rung ladder (power, Tools
+  heartbeat, reachable address, service port) and reports the rung it stopped
+  at. See that module for the two lab research findings that shaped it.
 
 The one thing `host_resources` will not do is answer "will another VM fit?".
 VMware's per-VM overhead is invisible from outside the hypervisor, so the tool
@@ -70,7 +74,7 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
-from vm_mcp import hostinfo, roster
+from vm_mcp import health, hostinfo, roster
 from vm_mcp.vmrun import VmrunUnavailable, list_running_vmx, tools_state
 
 __version__ = "0.1.0"
@@ -111,8 +115,10 @@ mcp = MCPServer(
     instructions=(
         "Inspects a local VMware Workstation lab: Windows domain controllers, "
         "servers, and Linux hosts. Call list_vms to see what is registered and "
-        "what is running, then vm_status for the detail of one VM. This "
-        "milestone is read-only; no tool changes a VM's state."
+        "what is running, vm_status for the detail of one VM, guest_health to "
+        "tell a powered-on guest from one that is actually answering, and "
+        "host_resources to see what the VMs cost the host. No tool changes a "
+        "VM's state."
     ),
 )
 
@@ -546,6 +552,101 @@ async def host_resources() -> dict[str, Any]:
         result["vm_memory_error"] = vmrun_error
         result.pop("vm_memory")
         result.pop("headroom_gib")
+
+    return result
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def guest_health(
+    uuid: str | None = None,
+    name: str | None = None,
+    port: int | None = None,
+) -> dict[str, Any]:
+    """Report whether a guest OS is actually answering, not just powered on.
+
+    Identifies the VM by `uuid` (preferred, unambiguous) or `name` (matched
+    loosely), exactly like `vm_status`. The verdict comes from a four-rung
+    ladder, and the result names the highest rung an observation was made at:
+
+      power   -- is the VM powered on at all? Not on means `down`.
+      tools   -- is the VMware Tools agent heartbeating? A hypervisor-side
+                 signal that takes no credentials and separates a booting or
+                 frozen guest from one whose OS is actually scheduling.
+      address -- discover a guest address the host can route to. Re-done every
+                 call, because lab addresses can be DHCP and change per boot.
+      service -- open a TCP connection to the guest's service port and close
+                 it again. Only this rung answers `up`: a powered-on guest
+                 whose services answer nothing is `degraded`.
+
+    Args:
+        uuid: The VM's hardware UUID, as reported by `list_vms`.
+        name: Name or label of the VM, matched loosely like `vm_status`.
+        port: Probe this port instead of the guest-family default
+            (Windows: 3389 RDP then 445 SMB; Linux: 22 SSH). Pass it when the
+            guest family has no default port or you want a specific service.
+
+    Returns:
+        A dict with:
+          verdict: `up`, `degraded`, `down`, or `unknown`.
+          reached: the highest rung an observation was made at -- `power`,
+              `tools`, `address`, or `service`.
+          reason: what answered, or why the ladder stopped where it did.
+          power_state: `running`, `stopped`, or `unknown` if VMware could not
+              be asked.
+          tools_state: when observed -- `running`, `installed`, or an
+              unavailable note.
+          address: the probed guest address, with `address_source` naming
+              where it was found (`get-guest-ip` or `neighbor-cache`).
+          probes: one entry per port attempt -- `port`, `result`
+              (`open`, `refused`, `timeout`, `error`), `ms`.
+          rejected_addresses: candidate addresses observed but rejected as not
+              reachable from the host. VMware reports the lab's static
+              address, which this host has no route to, so this keeps the
+              throw-away visible instead of silent.
+          vmx_exists: False when the registry lists a VM whose .vmx is gone.
+
+    Note:
+        `down` and `unknown` are different answers on purpose. `down` means
+        VMware was asked and said the VM is off. `unknown` means VMware could
+        not be asked at all -- claiming `down` during a host fault would be a
+        confident report that every VM in the lab is off.
+
+    Note:
+        No guest credentials are used at any rung, and a probe is a bare TCP
+        connect closed immediately: it sends no data and asks for nothing.
+    """
+    try:
+        vm = roster.resolve(uuid=uuid, name=name)
+    except roster.RosterError as exc:
+        # Covers UnknownVm, AmbiguousName and IdentifierMismatch. Each already
+        # carries a message written for the caller, including what *is*
+        # available when the identifier did not match.
+        raise ToolError(str(exc)) from exc
+
+    if port is not None and not 1 <= port <= 65535:
+        # Validation error, passed raw per the tool-error contract.
+        raise ToolError(f"port must be between 1 and 65535, got {port}")
+
+    vmx_exists = Path(vm.vmx).is_file()
+    fields = _read_vmx_fields(vm.vmx) if vmx_exists else {}
+    guestos = fields.get("guestos", "")
+    family = os_family(guestos) if guestos else "unknown"
+
+    result = {
+        "name": vm.name,
+        "uuid": vm.uuid,
+        "vmx_exists": vmx_exists,
+        **await health.check_health(
+            vm.vmx, fields, family=family, port=port
+        ),
+    }
+
+    if not vmx_exists:
+        # A stale registry entry cannot be running, so the ladder ended `down`;
+        # the reason *why* it cannot run is the more useful answer.
+        result["reason"] = (
+            f"{result['reason']} -- and the VM's .vmx is missing from disk"
+        )
 
     return result
 

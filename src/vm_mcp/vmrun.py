@@ -41,6 +41,7 @@ __all__ = [
     "run_vmrun",
     "list_running_vmx",
     "tools_state",
+    "get_guest_ip",
     "parse_list_output",
     "normalize_uuid",
 ]
@@ -253,6 +254,43 @@ async def tools_state(
     # passed through rather than guessed at, so an unexpected value shows up in
     # the tool result instead of being silently normalised to a wrong one.
     return result.stdout.strip().lower()
+
+
+async def get_guest_ip(
+    vmx_path: str | Path,
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    executable: Path | None = None,
+) -> str | None:
+    """Return the guest's own reported IP address, or None when it has none.
+
+    This is `getGuestIPAddress`, which needs VMware Tools running in the guest.
+    The answer is *unvalidated*: it reports one address of several, and on this
+    lab it has been observed returning an address the host cannot route to on
+    one VM and the host-reachable one on another (research blocker B2). This
+    function returns it and nothing more; reachability checking and the probe
+    live in `health.py`, so the tool's result can say where each address came
+    from and which ones were thrown away.
+
+    Args:
+        vmx_path: Absolute path to the VM's `.vmx` file.
+
+    Returns:
+        The IP string, or None when vmrun declined to answer (guest powered
+        off, Tools not running, or no address acquired yet). A decline is the
+        guest's problem, not the host's.
+
+    Raises:
+        VmrunUnavailable: vmrun failed or timed out, which is a host fault and
+            must stay distinguishable from "this guest has no address".
+    """
+    result = await run_vmrun(
+        ["getGuestIPAddress", str(vmx_path)], timeout=timeout, executable=executable
+    )
+    if not result.ok:
+        return None
+    text = result.stdout.strip()
+    return text or None
 
 
 def normalize_uuid(value: str) -> str:

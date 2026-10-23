@@ -75,6 +75,22 @@ written about -- so both calls must surface the flight instead of sailing
 through it. `hard` stays exempt: it is the documented escape hatch for a
 wedged guest, and a refusal that locked the user out of it would be a
 safety mechanism trapping the user inside it.
+
+The claim is placed at the *entry* of `stop`, before the `is_running`
+pre-check -- not at the moment the shutdown is handed to VMware. The
+pre-check is a vmrun round-trip (~0.9s measured), and it is an await, so a
+start handler entering the event loop in the same batch would otherwise be
+able to run its whole refusal check inside that window and read a clear
+registry. A start that does not merely fight the shutdown but overtakes it
+is worse than it reads: on this host, a `vmrun start` accepted mid-shutdown
+was queued by VMware and materialized 70 seconds after the guest had
+exited, a deferred power-on arriving with no further call from anyone.
+Claiming synchronously at entry closes the window to zero width for a
+single-threaded event loop: once the stop handler has entered, no later
+handler in the same batch can read an unclaimed registry. The claim is
+released where its rationale ends -- pre-check finds the machine already
+off, the spawn fails, hard has concluded its work -- and the reaper
+releases what its own vmrun keeps alive.
 """
 
 from __future__ import annotations
@@ -302,7 +318,11 @@ async def start(
     There is no in-flight check here: the tool layer consults
     `shutdown_in_flight` before calling, because a hard restart's internal
     start has a right to pass -- the flight that motivated its `hard` stop is
-    over by the time that start runs.
+    over by the time that start runs. The check being at the layer's entry
+    is not decoration: a start accepted mid-shutdown was observed to be
+    *queued* by VMware on this host and materialized 70s after the guest had
+    exited, so the refusal is not only about clobbering live state but about
+    a deferred power-on no call asked to schedule.
 
     Returns:
         A PowerOutcome whose `power_state` was read back from VMware.
@@ -404,36 +424,80 @@ async def stop(
         raise ValueError(f"stop mode must be {STOP_SOFT!r} or {STOP_HARD!r}, not {mode!r}")
 
     started = time.monotonic()
+    key = _norm(vmx_path)
 
-    # Stopping an already-stopped VM is the desired end state, and vmrun reports
-    # it as an error: `Error: The virtual machine is not powered on`. Surfacing
-    # that would make a routine no-op look like a failure in the result an agent
-    # reads -- and `restart_vm` on a stopped VM hits it every time. Checked first,
-    # so the common idempotent case costs one `vmrun list` and returns cleanly.
-    running, error = await is_running(vmx_path, executable=executable)
-    if running is False:
-        return PowerOutcome(
-            power_state=POWER_STOPPED,
-            confirmed=True,
-            waited_s=time.monotonic() - started,
-            detail="the VM was already powered off; nothing to stop.",
+    # The flight claims BEFORE the pre-check, not inside the startup that
+    # follows it. The pre-check is a vmrun round-trip (~0.9s measured), and
+    # it is an await: another handler entering the event loop in the same
+    # batch used to be able to run its whole refusal check inside this
+    # window and read a clear registry -- and a start that passes the check
+    # does not merely fight the shutdown, VMware makes it worse: one
+    # accepted mid-shutdown was queued on this host and materialized 70s
+    # after the guest had exited, a deferred power-on reported to the agent
+    # as two clean successes. Claimed at entry, used-room check-and-set is
+    # synchronous against every other handler's read in the same loop: the
+    # race window is zero wide, not small. The claim is released when its
+    # rationale is exhausted -- the pre-check finds the machine already off
+    # (no flight will exist), the spawn fails, hard has concluded its work
+    # and answered whatever it saw -- and the reaper releases what its own
+    # vmrun keeps alive.
+    claiming = mode == STOP_SOFT and key not in _SOFT_STOPS_IN_FLIGHT
+    if claiming:
+        _SOFT_STOPS_IN_FLIGHT[key] = _Flight(requested_at=time.monotonic())
+
+    try:
+        # Stopping an already-stopped VM is the desired end state, and vmrun
+        # reports it as an error: `Error: The virtual machine is not powered
+        # on`. Surfacing that would make a routine no-op look like a failure
+        # in the result an agent reads -- and `restart_vm` on a stopped VM
+        # hits it every time. Checked first, so the common idempotent case
+        # costs one `vmrun list` and returns cleanly.
+        running, error = await is_running(vmx_path, executable=executable)
+        if running is False:
+            if claiming:
+                _SOFT_STOPS_IN_FLIGHT.pop(key, None)
+            return PowerOutcome(
+                power_state=POWER_STOPPED,
+                confirmed=True,
+                waited_s=time.monotonic() - started,
+                detail="the VM was already powered off; nothing to stop.",
+            )
+
+        if mode == STOP_HARD:
+            # Unobservable state also proceeds here, as it always has: hard
+            # is fast, and the outcome below is observed whatever the
+            # pre-check saw. The cut is the end of this guest's flight,
+            # whatever the outcome: a soft-stop marker still live at this
+            # point is released, and the reaper's own pop is a no-op if it
+            # got there first.
+            outcome = await _stop_and_confirm_hard(
+                vmx_path, started, executable=executable
+            )
+            _SOFT_STOPS_IN_FLIGHT.pop(key, None)
+            return outcome
+
+        # The VM is -- as far as anything can be seen -- powered on. Hand the
+        # graceful shutdown to VMware and answer immediately; even when the
+        # pre-check was blind (running is None, vmrun list itself failed), the
+        # request is still issued, because a host fault must not silently turn
+        # "stop this VM" into a no-op that reports success without checking. The
+        # result carries `confirmed=False` either way: nothing here has seen the
+        # guest go down.
+        return await _initiate_soft_stop(
+            vmx_path,
+            started,
+            precheck_error=error,
+            executable=executable,
+            claiming=claiming,
         )
-
-    if mode == STOP_HARD:
-        # Unobservable state also proceeds here, as it always has: hard is
-        # fast, and the outcome below is observed whatever the pre-check saw.
-        return await _stop_and_confirm_hard(vmx_path, started, executable=executable)
-
-    # The VM is -- as far as anything can be seen -- powered on. Hand the
-    # graceful shutdown to VMware and answer immediately; even when the
-    # pre-check was blind (running is None, vmrun list itself failed), the
-    # request is still issued, because a host fault must not silently turn
-    # "stop this VM" into a no-op that reports success without checking. The
-    # result carries `confirmed=False` either way: nothing here has seen the
-    # guest go down.
-    return await _initiate_soft_stop(
-        vmx_path, started, precheck_error=error, executable=executable
-    )
+    except BaseException:
+        # An authored claim never outlives the call that made it. Whatever
+        # rises and falls here -- spawn failure, cancellation -- the slot is
+        # cleared so the caller's next look at this VM is not "shutting down"
+        # against nothing.
+        if claiming:
+            _SOFT_STOPS_IN_FLIGHT.pop(key, None)
+        raise
 
 
 async def _stop_and_confirm_hard(
@@ -587,6 +651,7 @@ async def _initiate_soft_stop(
     *,
     precheck_error: str | None = None,
     executable: Path | None = None,
+    claiming: bool = False,
 ) -> PowerOutcome:
     """Issue `vmrun stop <vmx> soft` and answer before the guest obeys.
 
@@ -604,26 +669,32 @@ async def _initiate_soft_stop(
 
     One stop per VM at a time: a second soft stop for a VM whose shutdown is
     already in flight joins the existing one rather than spawning a second
-    vmrun process against the same guest.
+    vmrun process against the same guest. `claiming` says whether the caller
+    already holds the claim -- `stop` claims at entry, before its pre-check,
+    so a start in the same batch cannot read a clear registry in the
+    pre-check window. With no caller claim, this function joins a live
+    flight, or claims and owns a fresh one should the entry have been reaped
+    between the two.
     """
     key = _norm(vmx_path)
     if key in _SOFT_STOPS_IN_FLIGHT:
-        return PowerOutcome(
-            power_state=POWER_STOPPING,
-            confirmed=False,
-            waited_s=time.monotonic() - started,
-            vmrun_error=precheck_error,
-            detail=_JOIN_DETAIL,
-        )
-
-    # Claim the slot before the first await. Above the check and the spawn
-    # there is an interleaving window between concurrent calls -- the event
-    # loop can run another coroutine between this function's awaits -- and a
-    # check-then-register placed the wrong way round would let both calls
-    # through. Claiming first makes the window zero wide: at most one call
-    # ever holds a given key. Releasing on a failed spawn keeps a crashed
-    # startup from permanently pinning the VM into "already stopping".
-    _SOFT_STOPS_IN_FLIGHT[key] = _Flight(requested_at=time.monotonic())
+        # A live flight for this guest. The caller arriving without a claim
+        # joins it. The caller that claimed at entry is the owner: no other
+        # path can have registered this key while it held the loop, because
+        # both the header read and the claim are synchronous and adjacent.
+        if not claiming:
+            return PowerOutcome(
+                power_state=POWER_STOPPING,
+                confirmed=False,
+                waited_s=time.monotonic() - started,
+                vmrun_error=precheck_error,
+                detail=_JOIN_DETAIL,
+            )
+    else:
+        # Unclaimed on entry and the flight was cleared (or the entry path
+        # was never reached): this call becomes the owner. The timestamp is
+        # fresh because the flight is.
+        _SOFT_STOPS_IN_FLIGHT[key] = _Flight(requested_at=time.monotonic())
     args = ["stop", str(vmx_path), STOP_SOFT]
     try:
         process = await spawn_vmrun(args, executable=executable)

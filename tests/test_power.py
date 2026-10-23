@@ -1211,6 +1211,147 @@ def test_hard_restart_is_the_override_and_is_not_refused(
     assert power._SOFT_STOPS_IN_FLIGHT == {}
 
 
+# --- the claim precedes the pre-check ---------------------------------------
+
+
+def test_a_batch_concurrent_start_cannot_wedge_between_stop_and_precheck(
+    lab, fake_vmrun
+) -> None:
+    """The remaining race, closed: stop claims at entry, not after its pre-check.
+
+    The refusal check lives at the start handler's entry, and the flight's
+    claim used to sit inside `_initiate_soft_stop` -- after a ~0.9s
+    `is_running` pre-check. Two handlers entering the same event loop in one
+    batch therefore raced: the start read a clear registry in the pre-check
+    window and issued `vmrun start` into a machine winding down -- one
+    accepted mid-shutdown and, this host shows, queued by VMware until it
+    materialized 70s after the guest had exited, a deferred power-on
+    reported to the agent as two clean successes. The claim now precedes
+    the pre-check (a single synchronous block with no await between), so
+    once the stop handler has entered, any handler entering after it reads
+    the claimed registry: refused, with no start in the command log. The
+    one-hop yield is what makes this a batch: without it, both calls would
+    run sequentially inside one coroutine and never interleave at all.
+    """
+    harness = fake_vmrun(stop_never_dies=True)
+
+    async def batch() -> Any:
+        lab["dc01"].running = True
+        stop_task = asyncio.create_task(server.stop_vm(uuid=DC01_UUID))
+        await asyncio.sleep(0)  # stop's handler is entered; claim is already live
+        with pytest.raises(ToolError) as excinfo:
+            await server.start_vm(uuid=DC01_UUID)
+        stop_result = await stop_task
+        pending = [t for t in power._BACKGROUND if not t.done()]
+        if pending:
+            await asyncio.gather(*pending)
+        return stop_result, excinfo
+
+    stop_result, excinfo = asyncio.run(batch())
+
+    assert "in flight" in str(excinfo.value)
+    assert not any(c[0] == "start" for c in harness.calls), (
+        "no start may be issued into a shutdown the same batch just claimed"
+    )
+    stops = [c for c in harness.calls if c[0] == "stop"]
+    assert stops == [["stop", lab["dc01"].path, "soft"]], (
+        f"the stop must proceed normally once it has claimed, got {stops}"
+    )
+    assert stop_result["power_state"] == "stopping"
+    assert power._SOFT_STOPS_IN_FLIGHT == {}
+
+
+def test_start_before_any_flight_exists_is_a_legitimate_sequence(
+    lab, fake_vmrun
+) -> None:
+    """The refusal is stateful, not clairvoyant.
+
+    In the same batch, a start whose handler enters before the stop's is a
+    start of a machine no one has asked to shut down yet: it proceeds,
+    sets the machine running, and the stop that follows claims a flight
+    against that running guest and shuts it down. This is the direction
+    the guarantee does NOT reach -- and if the claim moved earlier than
+    it does (say, to a scan of pending batches), this is the case that
+    would start refusing legitimate work.
+    """
+    harness = fake_vmrun(stop_never_dies=True)
+
+    async def batch() -> Any:
+        start_task = asyncio.create_task(server.start_vm(uuid=DC01_UUID))
+        await asyncio.sleep(0)  # start's handler is entered; nothing in flight
+        stop_task = asyncio.create_task(server.stop_vm(uuid=DC01_UUID))
+        results = await asyncio.gather(start_task, stop_task)
+        pending = [t for t in power._BACKGROUND if not t.done()]
+        if pending:
+            await asyncio.gather(*pending)
+        return results
+
+    start_result, stop_result = asyncio.run(batch())
+
+    assert start_result["power_state"] == "running"
+    assert stop_result["power_state"] == "stopping"
+    assert ["start", lab["dc01"].path, "nogui"] in harness.calls
+    stops = [c for c in harness.calls if c[0] == "stop"]
+    assert stops == [["stop", lab["dc01"].path, "soft"]]
+    assert power._SOFT_STOPS_IN_FLIGHT == {}
+
+
+def test_the_claim_is_released_when_the_precheck_finds_the_machine_off(
+    lab, fake_vmrun
+) -> None:
+    """A claim made before the pre-check must die with its rationale.
+
+    The claim now exists for the duration of the ~0.9s pre-check, which is
+    the point: it covers any handler trying to slip into that window. But a
+    stop of a machine that turns out to be already off produces no flight,
+    so the claim must be released in the same call -- otherwise a start
+    right after (the ordinary next step: stopped, confirm, start it back
+    up) is refused against nothing.
+    """
+    harness = fake_vmrun()
+
+    async def flow() -> Any:
+        stop_result = await server.stop_vm(uuid=DC01_UUID)
+        start_result = await server.start_vm(uuid=DC01_UUID)
+        return stop_result, start_result
+
+    stop_result, start_result = asyncio.run(flow())
+
+    assert stop_result["power_state"] == "stopped"
+    assert stop_result["confirmed"] is True
+    assert "already powered off" in stop_result["detail"]
+    assert start_result["power_state"] == "running"
+    assert ["start", lab["dc01"].path, "nogui"] in harness.calls
+    # The already-off branch spawned nothing: one flight claimed, none made.
+    assert not any(c[0] == "stop" for c in harness.calls)
+    assert power._SOFT_STOPS_IN_FLIGHT == {}
+
+
+def test_stop_hard_releases_a_foreign_flight_when_its_work_is_done(
+    lab, fake_vmrun
+) -> None:
+    """The hard cut ends the guest's flight; the marker must not outlive it.
+
+    A soft-flight marker can be live when a hard stop runs (an earlier
+    graceful request against this guest, or the same batch). The cut is the
+    flight's end whatever the outcome reports -- the hard path verifies its
+    own answer before returning -- so the branch releases the marker, and
+    the reaper's own pop is a no-op when it gets there first. Without the
+    release, a start issued after a confirmed-hard stop would refuse
+    against a marker whose vmrun had already exited.
+    """
+    key = power._norm(lab["dc01"].path)
+    power._SOFT_STOPS_IN_FLIGHT[key] = power._Flight(requested_at=0.0)
+    harness = fake_vmrun()
+
+    result = call_powered(server.stop_vm, lab, uuid=DC01_UUID, mode="hard")
+
+    assert result["power_state"] == "stopped"
+    assert result["confirmed"] is True
+    assert power._SOFT_STOPS_IN_FLIGHT == {}
+    assert ["stop", lab["dc01"].path, "hard"] in harness.calls
+
+
 def test_stop_vm_description_carries_the_fire_and_forget_contract() -> None:
     """The full contract must live in the description, not only in the code.
 

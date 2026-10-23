@@ -451,7 +451,7 @@ async def restart(
     *,
     mode: str = STOP_SOFT,
     executable: Path | None = None,
-) -> tuple[PowerOutcome, PowerOutcome | None]:
+) -> tuple[PowerOutcome, PowerOutcome | None, str]:
     """Stop a VM, then power it back on -- or hand the start back to the caller.
 
     Both halves report independently, and a stop that only partly worked is not
@@ -466,19 +466,21 @@ async def restart(
         mode: Stop mode, as for `stop`.
 
     Returns:
-        `(stop_outcome, start_outcome)`, with `start_outcome` **None when there
-        is no start to reports yet**:
+        `(stop_outcome, start_outcome, stop_half)`. `start_outcome` is None
+        when the start was not issued; `stop_half` names the flow so no reader
+        has to infer it from which keys happen to be present:
 
-        * VM found already powered off: no stop is issued, the start runs
-          immediately (it is fast), and both halves are returned whole.
-        * `mode="hard"` with a confirmed stop: the full cycle inside the call,
-          both halves returned whole.
-        * `mode="soft"` on a running VM: the shutdown is now in flight; the
-          start is deliberately left to the caller, who issues `start_vm` once
-          the read-only tools show stopped. Nothing here outruns the shutdown
-          it just asked for.
-        * `mode="hard"` whose stop did not confirm: the refusal outcome below
-          rather than a start over a possibly-running machine.
+        * `"done"` -- both halves ran inside the call. The VM was found
+          already off (no stop issued, start immediate), or a `mode="hard"`
+          stop confirmed and the start ran. `start_outcome` carries whatever
+          the start observed.
+        * `"handoff"` -- a `mode="soft"` stop on a running VM. The shutdown is
+          in flight in the background; the start is deliberately left to the
+          caller, who issues `start_vm` once the read-only tools show
+          stopped. Nothing here outruns the shutdown it just asked for.
+        * `"blocked"` -- `mode="hard"` whose stop did not confirm. The
+          refusal outcome below rides in `start_outcome` rather than a start
+          over a possibly-running machine.
 
     Raises:
         VmrunUnavailable: A command could not be issued.
@@ -495,7 +497,7 @@ async def restart(
         # A confirmed stop means the VM is down *right now* -- which, before
         # any soft stop was issued, is exactly the "already off" case. The
         # restart completes here and cheaply.
-        return stopped, await start(vmx_path, executable=executable)
+        return stopped, await start(vmx_path, executable=executable), "done"
 
     if mode == STOP_SOFT:
         # A graceful shutdown is in flight in the background. The caller
@@ -508,7 +510,7 @@ async def restart(
             "to finish it."
         )
         detail = f"{stopped.detail} {note}" if stopped.detail else note
-        return replace(stopped, detail=detail), None
+        return replace(stopped, detail=detail), None, "handoff"
 
     # `hard`: the stop ran, blocked, and did not come back confirmed. Refuse
     # the start rather than power on over a machine that may still be running:
@@ -523,7 +525,7 @@ async def restart(
             "running VM would produce a machine that looks up and is not."
         ),
     )
-    return stopped, refusal
+    return stopped, refusal, "blocked"
 
 
 # --- graceful stop internals ----------------------------------------------

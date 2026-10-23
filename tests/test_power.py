@@ -747,13 +747,16 @@ def test_hard_restart_stops_then_starts(lab, fake_vmrun) -> None:
     """`hard` is fast enough (~2s cut, ~3s start) to finish inside the call.
 
     This is the one restart mode where both halves can be observed in the
-    call's own lifetime, so this is where the stop-before-start ordering is
-    pinned.
+    call's own lifetime, so this is where the stop-before-start ordering and
+    the `done` flow tag are pinned: the result states outright that no half
+    of this restart was left to the caller, rather than implying it from the
+    mere presence of both halves.
     """
     harness = fake_vmrun()
 
     result = call_powered(server.restart_vm, lab, uuid=DC01_UUID, mode="hard")
 
+    assert result["stop_half"] == "done"
     assert result["stopped"]["power_state"] == "stopped"
     assert result["started"]["power_state"] == "running"
     assert lab["dc01"].running is True
@@ -788,7 +791,9 @@ def test_hard_restart_does_not_start_a_vm_that_did_not_stop(
 
     A failed stop followed by a start produces a machine that looks up and is
     not -- two power states disagreeing and no report of it. The restart stops
-    there and says so.
+    there and says so, both in the refusal's own detail and in the flow tag:
+    `stop_half: "blocked"` is distinguishable from `"done"` by clients that
+    count keys, without anyone having to interpret prose.
     """
     harness = fake_vmrun(stop_never_dies=True)
     # Confirming a hard stop against a wedged guest would spend STOP_HARD_TIMEOUT
@@ -798,7 +803,15 @@ def test_hard_restart_does_not_start_a_vm_that_did_not_stop(
 
     result = call_powered(server.restart_vm, lab, uuid=DC01_UUID, mode="hard")
 
-    assert result["stopped"]["power_state"] == "running"
+    assert result["stopped"]["power_state"] == "running", (
+        "the wedged guest is still up: that is the observed stop half, and "
+        "the reason the start half is refused"
+    )
+    assert result["stop_half"] == "blocked"
+    assert result["started"] is not None, (
+        "the refusal rides in `started`, so the shape stays stable and the "
+        "reason is in the field a client already knows to read"
+    )
     assert result["started"]["confirmed"] is False
     assert "not confirmed stopped" in result["started"]["detail"].lower()
 
@@ -814,10 +827,10 @@ def test_soft_restart_hands_the_start_back_to_the_caller(lab, fake_vmrun) -> Non
     A graceful shutdown runs in the background now, so a restart cannot
     confirm the guest left inside its own call -- and starting over a VM that
     is *and is not* still shutting down is the trap `restart` exists to avoid.
-    So the tool answers with the stop half only (`stopping`), its detail
-    names the tool that completes the restart, and -- rather than a phantom
-    `started` half that would read as a finished restart -- `started` is
-    simply absent until something can honestly report one.
+    So the tool answers with the stop half (`stopping`) and a null `started`
+    half, its detail names the tool that completes the restart, and
+    `stop_half: "handoff"` states the flow outright rather than leaving the
+    caller to read a missing key.
     """
     harness = fake_vmrun()
 
@@ -825,9 +838,14 @@ def test_soft_restart_hands_the_start_back_to_the_caller(lab, fake_vmrun) -> Non
 
     assert result["stopped"]["power_state"] == power.POWER_STOPPING
     assert result["stopped"]["confirmed"] is False
-    assert "started" not in result, (
-        "the start was deliberately not issued; a `started` half would read "
-        "as a completed restart"
+    assert result["started"] is None, (
+        "no start ran on this path; a populated `started` half would read as "
+        "a completed restart"
+    )
+    assert result["stop_half"] == "handoff", (
+        "the flow must be stated outright: review found that started going "
+        "missing was read as a bug, so the result now says what happened "
+        "instead of implying it from a missing key"
     )
     assert "start_vm" in result["stopped"]["detail"].lower(), (
         "the handoff must name the tool that completes it"
@@ -857,6 +875,7 @@ def test_soft_restart_of_a_stopped_vm_completes_at_once(lab, fake_vmrun) -> None
     assert result["stopped"]["power_state"] == "stopped"
     assert result["started"]["power_state"] == "running"
     assert ["start", lab["dc01"].path, "nogui"] in harness.calls
+    assert result["stop_half"] == "done"
 
 
 def test_restart_forwards_the_stop_mode(lab, fake_vmrun) -> None:
@@ -1094,8 +1113,9 @@ def test_restart_vm_description_carries_the_handoff_contract() -> None:
 
     The tool does not issue the start on the soft path, so the description is
     the only place that teaches the two-step dance: poll until stopped, then
-    call start_vm. Without it, `started` going missing from the result looks
-    like a bug rather than a design.
+    call start_vm. Without it, a null `started` looks like a bug rather than
+    a design -- which is exactly the misreading that motivated `stop_half`,
+    and why the description and the field are both pinned here.
     """
 
     async def go() -> dict[str, Any]:
@@ -1107,3 +1127,10 @@ def test_restart_vm_description_carries_the_handoff_contract() -> None:
     assert "start_vm" in text, "must name the tool that completes the restart"
     assert "stopped" in text and "poll" in text, "must say how to observe"
     assert "hard" in text, "the in-call cycle must be distinguishable from the handoff"
+    assert "stop_half" in text, (
+        "the flow tag must be described: it is the result's statement of its "
+        "own shape, and a reader has to be able to interpret it"
+    )
+    assert "null" in text and "handoff" in text, (
+        "must teach that started: null is the handoff, not an omission"
+    )

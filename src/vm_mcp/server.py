@@ -882,28 +882,50 @@ async def restart_vm(
         A dict with:
           name, uuid, vmx: the VM that was acted on.
           mode: the mode actually used.
+          stop_half: `"done"`, `"handoff"` or `"blocked"` -- which shape the
+              result has, stated outright instead of being inferred from
+              which other keys are present:
+
+              * `"done"` -- both halves ran in this call. The VM was found
+                already off (no stop needed, start immediate) or a `hard`
+                stop confirmed and the start ran. `started` is the
+                `start_vm` result.
+              * `"handoff"` -- the soft shutdown is in flight; the result
+                has `started: null` and the stop half's detail tells you to
+                call start_vm once vm_status reads `stopped`. That null is
+                the design, not an omission, and `stop_half` is how you
+                distinguish it from a missing key.
+              * `"blocked"` -- the hard stop did not confirm, so the start
+                was refused. `started` carries the refusal and its reason.
           stopped: the `stop_vm` result (`power_state`, `confirmed`,
               `waited_s`, any `detail`). With `mode: "soft"` this is
               `power_state: "stopping"`, `confirmed: false` and a `detail`
               that tells you to call start_vm when vm_status shows stopped.
-          started: the `start_vm` result -- present when the VM was verified
-              down inside this call (already-off VMs, and confirmed hard
-              restarts). **Absent with a soft shutdown in flight**: that is
-              the handoff, not an omission.
+          started: the `start_vm` result when one ran; **null** when the
+              start belongs to the caller (see `stop_half`).
 
-        When `started` is present, the usual rule applies: `running` means
-        powered on, not usable -- expect roughly 150s more before the guest
-        answers. That half is reported even when the stop was unremarkable,
-        because the case worth seeing is a machine that came back up *without
-        having cleanly stopped* and is running on stale state.
+        A provenance note the field replaces having to guess: `started` is
+        always present, so clients that walk the object never have to choose
+        between absent-key semantics and null semantics -- `stop_half` says
+        which shape applies.
+
+        When `started` holds a real start result, the usual rule applies:
+        `power_state == "running"` means powered on, not usable -- expect
+        roughly 150s more before the guest answers. That half is reported
+        even when the stop was unremarkable, because the case worth seeing is
+        a machine that came back up *without having cleanly stopped* and is
+        running on stale state.
     """
     vm = _resolve_for_power(uuid, name)
     mode = _power_mode(mode)
-    stopped, started = await power.restart(vm.vmx, mode=mode)
-    payload = {**_identity(vm), "mode": mode, "stopped": stopped.as_dict()}
-    if started is not None:
-        payload["started"] = started.as_dict()
-    return payload
+    stopped, started, stop_half = await power.restart(vm.vmx, mode=mode)
+    return {
+        **_identity(vm),
+        "mode": mode,
+        "stop_half": stop_half,
+        "stopped": stopped.as_dict(),
+        "started": started.as_dict() if started is not None else None,
+    }
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

@@ -1,13 +1,19 @@
 # Tools
 
-How each read-only tool behaves and why. The tool names and the one-line
-summaries are in the README; this is the detail. Four are shipped — the M1
-trio, plus `guest_health` from M3. No mutating tool exists.
+How each shipped tool behaves and why. The tool names and the one-line
+summaries are in the README; this is the detail. The read-only half is the
+M1 trio plus `guest_health` from M3; the mutating half (`start_vm`,
+`stop_vm`, `restart_vm`) is M2, in its own section further down.
 
-Every tool carries `ToolAnnotations(read_only_hint=True, destructive_hint=False)`
-(the `READ_ONLY` constant), and a test asserts that **every advertised tool** is
-read-only, so a tool added without annotations fails the suite rather than
-shipping silently. Annotations are a label to the model, not access control (see
+EVERY tool carries annotations: the read-only tools carry
+`ToolAnnotations(read_only_hint=True, destructive_hint=False)` (the
+`READ_ONLY` constant), while `start_vm` is shipped `MUTATES` and
+`stop_vm`/`restart_vm` are `DESTRUCTIVE` -- a `hard` stop risks guest
+filesystem damage, so its risk label is not the same as the start's. A test
+asserts that **every advertised tool** is described and annotated, and
+asserts the read-only claim per tool, so a tool added without annotations
+or with a lying one fails the suite rather than shipping silently.
+Annotations are a label to the model, not access control (see
 [`security.md`](security.md)).
 
 ## The shape rules
@@ -193,15 +199,83 @@ Verified live against a powered-on GOAD DC from the host: `up`, reached
 `get-guest-ip` — with the same VM's wazuh manager, powered off, answered
 `down` at the power rung in under a second.
 
-## Not in this milestone
+## The mutating half (M2: `start_vm`, `stop_vm`, `restart_vm`)
 
-- **`start_vm` / `stop_vm` / `restart_vm`** — the mutating half, deliberately
-  unwritten. The allowlist that gates it is
-  [#15](https://github.com/work-ai-llm/vm_mcp/issues/15), and the mutating tools
-  are intended to ship disabled by default in client configuration (see
-  [`security.md`](security.md)).
+The shape rules carry over: structured values, exit codes never trusted,
+identifiers resolved through the registry only. What changes is risk. These
+tools change the lab, so they ship **disabled by default** in
+`opencode.jsonc` and carry risk annotations rather than the read-only pair.
+
+### `start_vm`
+
+Issues `vmrun start <vmx> nogui` and confirms the VM *registered as running*
+by reading `vmrun list` back. It does not wait for the guest to be usable:
+measured on this host, the start command returns in ~2s and the guest needs
+~156s more before its services answer. `power_state: "running"` means
+powered on, emphatically not ready. An agent wanting readiness polls the
+read-only tools until `guest_health` ships to do it for it.
+
+### `stop_vm`
+
+`mode: "soft"` (default) issues `vmrun stop <vmx> soft` and answers
+**immediately** with `power_state: "stopping"`, `confirmed: false` -- a state
+the server commanded, not one it observed. That shape was forced by
+measurement, not chosen: opencode enforces a per-server *request timeout*
+(15000 ms in `opencode.jsonc`), the deadline sits on the response rather than
+on idleness, and a direct probe killed a 12s tool call at a 5s timeout while
+progress notifications were arriving every second. **No amount of waiting
+done inside the call survives a deadline that short**, so the shutdown does
+not happen inside the call: a background reaper task owns the spawned vmrun,
+drains its pipes so they cannot wedge it on Windows, logs its eventual exit,
+and kills it if it outlives the 960s ceiling. The agent confirms with
+`vm_status`/`list_vms` -- the same observation job it already does after a
+boot's ~156s.
+
+- **One graceful stop per VM at a time.** A second soft stop while one is in
+  flight *joins* it instead of spawning a second vmrun process against the
+  same guest. The flight is keyed by normalized `.vmx` path and cleared by
+  the reaper's done-callback, so a landed stop answers a repeat with the
+  clean already-off no-op, not a stale `stopping`.
+- **The per-call `detail` is a pointer, not the contract.** It names what
+  the agent needs in the moment -- it did not wait, what `waited_s` means
+  here, how to confirm -- and the full rationale lives in the tool
+  description, which is in context at decision time. The tests budget its
+  length so it cannot bloat its way back to a wall.
+- **`hard` is never automatic.** A guest that refuses to leave is reported,
+  never escalated: cutting power is the caller's deliberate follow-up, and
+  the tool is annotated destructive because an unclean shutdown on a Windows
+  domain controller risks guest filesystem damage.
+
+### `restart_vm`
+
+Takes `stop_vm`'s `mode`, reports the halves separately (`stopped`, then
+`started`), and states its own flow in `stop_half` so nobody has to decode
+result shapes:
+
+| `stop_half` | Meaning | `started` |
+|---|---|---|
+| `done` | Both halves ran in the call: the VM was already off, or a `hard` stop confirmed and the start ran. | the start result |
+| `handoff` | The soft shutdown is in flight. Poll `vm_status` to `stopped`, then call `start_vm`. | `null` |
+| `blocked` | The hard stop did not confirm; the start was refused rather than power on over a possibly-running machine. | the refusal and its reason |
+
+`started` is **always present**. A null is the handoff -- distinguishable
+because `stop_half` says so -- never a lost field.
+
+### `mode`, everywhere it appears
+
+`mode` is matched case-insensitively: `Hard` is the request the caller
+meant, and punctuation is not worth a failed power-off. Anything outside the
+two values is rejected by a tool error that echoes the bad value and names
+both valid values -- the same boundary discipline the name errors follow.
+The schema advertises `mode` as an enum, so a model choosing it sees the
+choices before it sends anything.
 
 The tool shapes above were confirmed against the live host, not only in unit
 tests: an unknown name is refused with no VMware process started, a powered-off VM
 is answered rather than treated as missing, and an unreachable `vmrun` yields a
-degraded value rather than an error.
+degraded value rather than an error. The power tools were verified live too --
+start, graceful stop, hard stop, restart and idempotence against the
+`PROVISIONING` jumpbox, lab left powered off and snapshot count unchanged --
+but that pass ran against the earlier *blocking* build of the stop; the
+fire-and-forget design above is test-verified, and a repeat live run against
+a real guest is the natural next verification.

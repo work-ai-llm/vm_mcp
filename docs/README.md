@@ -6,8 +6,9 @@ Design notes for the server. The top-level
 - [`architecture.md`](architecture.md) — the long-lived decisions: why `vmrun`,
   the two transports, the SDK pin, the registry and roster (#7), the `vmrun`
   layer (#8), and the tool-error contract (#3).
-- [`tools.md`](tools.md) — how each read-only tool behaves and why (#9),
-  including the `host_resources` internals and the `guest_health` ladder (#12).
+- [`tools.md`](tools.md) — how each shipped tool behaves and why (#9 for the
+  read-only half; the mutating half and its contracts from M2), including the
+  `host_resources` internals and the `guest_health` ladder (#12).
 - [`usage.md`](usage.md) — running the server, the client config, worktrees,
   transports.
 - [`security.md`](security.md) — the security posture and the real controls.

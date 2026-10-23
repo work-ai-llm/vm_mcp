@@ -749,6 +749,28 @@ def _power_mode(mode: str) -> str:
     return lowered
 
 
+def _refuse_during_shutdown(vm: roster.RegisteredVm, override: str) -> None:
+    """Refuse anything that would power a shutting-down VM back up.
+
+    While a soft shutdown is in flight the stop tools dedupe it, but a
+    *start* would fight it: a machine being told to go down and being told
+    to come up at the same time is the one confused state the power tools
+    refuse to create. `power.shutdown_in_flight` reports the flight's age,
+    and the refusal carries it -- interrupting a 5-second-old request and a
+    10-minute wedged one are different goings-on, and the message should let
+    the caller tell them apart. `hard` is the documented escape hatch, so
+    the override line sits in the same breath as the refusal: never a
+    lockout.
+    """
+    age = power.shutdown_in_flight(vm.vmx)
+    if age is not None:
+        raise ToolError(
+            f"a soft shutdown was issued for {vm.name!r} {age:.0f}s ago and "
+            "is still in flight -- starting now would fight it. Wait for "
+            f"vm_status to read 'stopped', then call again. {override}"
+        )
+
+
 @mcp.tool(annotations=MUTATES)
 async def start_vm(uuid: str | None = None, name: str | None = None) -> dict[str, Any]:
     """Power on one VM. Does not wait for the guest to finish booting.
@@ -777,16 +799,31 @@ async def start_vm(uuid: str | None = None, name: str | None = None) -> dict[str
         **~156s** before its OS finishes booting and services answer. Nothing in
         this result says the guest is ready, because nothing here has waited to
         find out. To wait for readiness, poll `vm_status` and watch `tools_state`
-        go to `running`; on a slow guest expect roughly 150s of that.
+        go to `running`; on a slow guest expect roughly 150s of that. If
+        `tools_state` stays `installed` noticeably longer than this guest's
+        usual boot, assume the guest is stuck -- inspect the console; this
+        tool cannot see the guest screen.
 
         A start that reports `power_state: stopped` with `confirmed: true` is a
         genuine failure -- `vmrun` claimed success and the VM did not appear.
+
+    Raises:
+        ToolError: while a soft shutdown for this VM is still in flight -- a
+            start issued during a shutdown is a machine both coming up and
+            going down. Wait for `vm_status`'s `stopped`, or take the machine
+            down right away with `stop_vm` and mode `'hard'` (the deliberate
+            override; it is never refused).
 
     Note:
         This tool starts a machine. It does not provision it, and it does not
         start anything else on the host.
     """
     vm = _resolve_for_power(uuid, name)
+    _refuse_during_shutdown(
+        vm,
+        "To take the machine fully down right away, stop_vm with mode 'hard' "
+        "is the deliberate override, and it is never refused.",
+    )
     outcome = await power.start(vm.vmx)
     return {**_identity(vm), **outcome.as_dict()}
 
@@ -826,7 +863,9 @@ async def stop_vm(
                 `stopped`. Re-reading is free; do not re-issue this tool just
                 to check state. A second soft call while one is in flight
                 **joins** the first rather than spawning another vmrun
-                process against the same guest.
+                process against the same guest. A start issued during this
+                flight is refused -- starting would fight the shutdown; see
+                start_vm. mode='hard' is never refused.
             `stopped` (hard): power is verifiably off, read back from
                 `vmrun list`. The VM was gone from the hypervisor list when
                 this was confirmed.
@@ -878,6 +917,14 @@ async def restart_vm(
             confirmed. Like `stop_vm`, `mode` is matched case-insensitively,
             and anything outside the two values is rejected with both named.
 
+    Raises:
+        ToolError: with `mode: "soft"` while a soft shutdown for this VM is
+            already in flight -- a restart cannot be layered onto another
+            shutdown, so it refuses rather than silently re-anchor to it.
+            `mode: "hard"` is the deliberate override that is never refused:
+            it cuts power, confirms the machine away, and brings it back up
+            in one call.
+
     Returns:
         A dict with:
           name, uuid, vmx: the VM that was acted on.
@@ -915,9 +962,23 @@ async def restart_vm(
         even when the stop was unremarkable, because the case worth seeing is
         a machine that came back up *without having cleanly stopped* and is
         running on stale state.
+
+        As in `start_vm`: if `tools_state` stays `installed` noticeably
+        longer than this guest's usual boot, assume the guest is stuck --
+        inspect the console; this tool cannot see the guest screen.
     """
     vm = _resolve_for_power(uuid, name)
     mode = _power_mode(mode)
+    if mode != "hard":
+        # `hard` is the documented escape hatch: never refused, at the entry
+        # either. It cuts power, confirms the VM away and starts it back up
+        # inside the call, so the flight that prompted it is over by then.
+        _refuse_during_shutdown(
+            vm,
+            "restart_vm with mode 'hard' is the deliberate override: it cuts "
+            "power, confirms the machine away, and brings it back up in one "
+            "call.",
+        )
     stopped, started, stop_half = await power.restart(vm.vmx, mode=mode)
     return {
         **_identity(vm),

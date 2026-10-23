@@ -61,6 +61,20 @@ make `stop_vm` a destructive tool wearing the name of a polite one, and the
 filesystem damage risk of an unclean shutdown is exactly the thing a caller
 should decide about rather than inherit. That decision is now the agent's,
 made when it sees a VM still running after a soft request.
+
+One flight per VM, in every direction
+-------------------------------------
+While a flight is live, the module keeps answering `stop`/`stop soft` for
+that VM by *joining* it -- a second shutdown request for the same guest
+protects nothing and risks interference. What it refuses instead is the
+opposite direction: `shutdown_in_flight` exists so a result-producing caller
+(a start above all) can refuse while one is live. A start issued while the
+guest is being told to shut down produces a machine that is both coming up
+and going down -- the exact confused state the restart refusal texts were
+written about -- so both calls must surface the flight instead of sailing
+through it. `hard` stays exempt: it is the documented escape hatch for a
+wedged guest, and a refusal that locked the user out of it would be a
+safety mechanism trapping the user inside it.
 """
 
 from __future__ import annotations
@@ -93,6 +107,7 @@ __all__ = [
     "POWER_UNKNOWN",
     "PowerOutcome",
     "is_running",
+    "shutdown_in_flight",
     "start",
     "stop",
     "restart",
@@ -143,11 +158,26 @@ _BACKGROUND: set["asyncio.Task[None]"] = set()
 # path. Two concurrent soft stops for one VM would spawn two vmrun processes
 # driving the same guest down -- wasted work at best, an interference risk at
 # worst -- so a second soft stop while one is in flight *joins* it and issues
-# nothing. Entries are cleared by the reaper's done-callback when the stop
-# lands, when it is killed at the ceiling, or when vmrun reports a failure;
-# after that the next soft request is genuinely new and spawns again. The
-# value is the initiating call's outcome, dropped in for whoever joins.
-_SOFT_STOPS_IN_FLIGHT: "dict[str, PowerOutcome]" = {}
+# nothing. Entries are cleared by the reaper at the moment its vmrun exits --
+# `vmrun stop soft` blocks until the guest is down, so that exit is the moment
+# the flight ends -- and the reaper's done-callback is the backstop for the
+# reaper itself failing. After that the next soft request is genuinely new and
+# spawns again.
+@dataclass(frozen=True)
+class _Flight:
+    """One graceful shutdown in flight, and when it was requested.
+
+    `requested_at` is `time.monotonic()` at claim time. It is what makes "how
+    long has this been going on" an answerable question: a start (or anything
+    else that would fight the guest from the other direction) refused while a
+    flight is live names its age, so the agent knows whether it interrupted a
+    5-second-old request or a wedged 10-minute hang.
+    """
+
+    requested_at: float
+
+
+_SOFT_STOPS_IN_FLIGHT: "dict[str, _Flight]" = {}
 
 # The joiner's detail. Separate from the initiating stop's wording because it
 # answers a different question: not "will you stop my VM" but "did you just
@@ -157,6 +187,21 @@ _JOIN_DETAIL = (
     "issued no new one. Check vm_status: once it reads 'stopped', the VM "
     "is off."
 )
+
+
+def shutdown_in_flight(vmx_path: str | Path) -> float | None:
+    """How long ago a graceful shutdown for this VM was requested, if one is.
+
+    Returns the age in seconds while the flight is live, None when it is
+    not. The tool layer consults this before a *start*: starting a machine
+    that is being told to go down is the one action that would fight the
+    flight rather than join it, and "no" has to say how long has elapsed so
+    the caller can decide between waiting and overriding with `hard`.
+    """
+    flight = _SOFT_STOPS_IN_FLIGHT.get(_norm(vmx_path))
+    if flight is None:
+        return None
+    return max(0.0, time.monotonic() - flight.requested_at)
 
 
 @dataclass(frozen=True)
@@ -253,6 +298,11 @@ async def start(
     register at all. **A confirmed `running` here means "powered on", emphatically
     not "usable"** -- the measured gap to a responsive guest is ~156s on this host.
     Callers wanting readiness must poll for it.
+
+    There is no in-flight check here: the tool layer consults
+    `shutdown_in_flight` before calling, because a hard restart's internal
+    start has a right to pass -- the flight that motivated its `hard` stop is
+    over by the time that start runs.
 
     Returns:
         A PowerOutcome whose `power_state` was read back from VMware.
@@ -573,9 +623,7 @@ async def _initiate_soft_stop(
     # through. Claiming first makes the window zero wide: at most one call
     # ever holds a given key. Releasing on a failed spawn keeps a crashed
     # startup from permanently pinning the VM into "already stopping".
-    _SOFT_STOPS_IN_FLIGHT[key] = PowerOutcome(
-        power_state=POWER_STOPPING, confirmed=False, waited_s=0.0
-    )
+    _SOFT_STOPS_IN_FLIGHT[key] = _Flight(requested_at=time.monotonic())
     args = ["stop", str(vmx_path), STOP_SOFT]
     try:
         process = await spawn_vmrun(args, executable=executable)
@@ -615,14 +663,24 @@ async def _reap_background_stop(
     in any result the caller received. On `SOFT_STOP_CEILING` the process is
     killed -- a stop that outlives it is the guest refusing shutdown, which
     the agent discovers through vm_status and answers with `hard` if it wants.
+
+    This reaper also owns the in-flight marker's lifetime. `vmrun stop soft`
+    blocks until the guest is down, so the moment this process exits is the
+    moment the flight ends -- the marker is cleared here, and the logged line
+    that follows is the only on-the-host record of how the flight actually
+    ended. The done-callback on the task is the backstop for a reaper that
+    fails in a way this function does not survive.
     """
     vmx = args[1]
+    key = _norm(vmx)
     try:
         result = await _collect(process, args, SOFT_STOP_CEILING)
     except VmrunUnavailable as exc:
+        _SOFT_STOPS_IN_FLIGHT.pop(key, None)
         logger.warning("background graceful stop for %s lost contact: %s", vmx, exc)
         return
 
+    _SOFT_STOPS_IN_FLIGHT.pop(key, None)
     if result.ok:
         logger.info("background graceful stop for %s finished (exit 0)", vmx)
     else:

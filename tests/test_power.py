@@ -1082,6 +1082,135 @@ def test_stop_and_restart_default_to_soft_in_the_schema() -> None:
         assert schema.get("enum") == ["soft", "hard"]
 
 
+# --- one flight per VM, in every direction ---------------------------------
+
+
+def test_start_refuses_to_fight_a_shutdown_in_flight(lab, fake_vmrun) -> None:
+    """The actual damage case: a start against a guest that is going down.
+
+    `stop_vm(soft)` answers before the guest is down, so for the whole
+    shutdown window the read-only tools still report `running` -- and an
+    impatient follow-up start used to sail straight through that window and
+    return `running, confirmed=True` seconds before the machine went dark.
+    Now the start is refused while the flight claims, the refusal carries the
+    flight's age, and the override is named in the same breath. Both calls
+    happen inside one event loop because the wedged-guest harness only holds
+    the marker that long: the fake's vmrun lands the moment the drain awaits
+    it, which is the case the *clears* test below covers.
+    """
+    harness = fake_vmrun(stop_never_dies=True)
+
+    async def flight_then_start() -> Any:
+        lab["dc01"].running = True
+        await server.stop_vm(uuid=DC01_UUID)
+        with pytest.raises(ToolError) as excinfo:
+            await server.start_vm(uuid=DC01_UUID)
+        pending = [t for t in power._BACKGROUND if not t.done()]
+        if pending:
+            await asyncio.gather(*pending)
+        return excinfo
+
+    excinfo = asyncio.run(flight_then_start())
+
+    assert "in flight" in str(excinfo.value), "must name the flight"
+    assert "hard" in str(excinfo.value), "must name the override in the same breath"
+    assert "vm_status" in str(excinfo.value), "must name the way to wait it out"
+    assert not any(c[0] == "start" for c in harness.calls), (
+        "the start must not be issued against a machine being told to go down"
+    )
+    assert power._SOFT_STOPS_IN_FLIGHT == {}
+
+
+def test_start_after_the_flight_clears_completes(lab, fake_vmrun) -> None:
+    """The refusal is a state, not a grudge.
+
+    Once the shutdown lands, the reaper clears the marker at the moment its
+    vmrun exits -- and a start that follows is an ordinary start. If the
+    marker leaked, the refusal would landlock exactly the machine someone
+    just shut down.
+    """
+    harness = fake_vmrun()
+
+    call(server.stop_vm, uuid=DC01_UUID)  # already off: lands at once, drains
+    result = call(server.start_vm, uuid=DC01_UUID)
+
+    assert result["power_state"] == "running"
+    assert ["start", lab["dc01"].path, "nogui"] in harness.calls
+    assert power._SOFT_STOPS_IN_FLIGHT == {}
+
+
+def test_soft_restart_refuses_while_a_shutdown_is_in_flight(
+    lab, fake_vmrun
+) -> None:
+    """A restart layered on a foreign flight must not silently re-anchor to it.
+
+    The agent asked for a restart. Joining would hand back a `stopping`
+    half-flight answering a request nobody made -- and its handoff note would
+    then instruct a start_vm that start_vm itself refuses while the flight
+    holds: a loop wearing the clothes of a plan. So the tool refuses with the
+    flight's age and points at the one call that cuts through, mode='hard'.
+    """
+    harness = fake_vmrun(stop_never_dies=True)
+
+    async def flight_then_restart() -> Any:
+        lab["dc01"].running = True
+        await server.stop_vm(uuid=DC01_UUID)
+        with pytest.raises(ToolError) as excinfo:
+            await server.restart_vm(uuid=DC01_UUID)
+        pending = [t for t in power._BACKGROUND if not t.done()]
+        if pending:
+            await asyncio.gather(*pending)
+        return excinfo
+
+    excinfo = asyncio.run(flight_then_restart())
+
+    assert "in flight" in str(excinfo.value)
+    assert "hard" in str(excinfo.value)
+    stops = [c for c in harness.calls if c[0] == "stop"]
+    assert stops == [["stop", lab["dc01"].path, "soft"]], (
+        f"the refusal must issue nothing, got {stops}"
+    )
+    assert power._SOFT_STOPS_IN_FLIGHT == {}
+
+
+def test_hard_restart_is_the_override_and_is_not_refused(
+    lab, fake_vmrun, monkeypatch
+) -> None:
+    """The escape hatch must open while the flight is live.
+
+    `hard` exists precisely for a guest that will not leave, so the refusal
+    may not landlock it: restart_vm with mode='hard' proceeds through a live
+    flight, runs the cut, and answers with its own honest outcome. Against a
+    wedged guest that outcome is `blocked` -- the hard stop ran but never
+    confirmed -- which still proves the entry check did not stand in the
+    way. And no `vmrun start` is issued here even in the success case the
+    entry check were bypassed by hand for: the start half refuses on its own
+    terms until the stop confirms.
+    """
+    harness = fake_vmrun(stop_never_dies=True)
+    # A wedged guest makes hard-stop confirmation expensive; shrink it. The
+    # point under test is the entry check passing, not the poll timing out.
+    monkeypatch.setattr(power, "STOP_HARD_TIMEOUT", 0.2)
+
+    async def flight_then_hard_restart() -> dict[str, Any]:
+        lab["dc01"].running = True
+        await server.stop_vm(uuid=DC01_UUID)
+        result = await server.restart_vm(uuid=DC01_UUID, mode="hard")
+        pending = [t for t in power._BACKGROUND if not t.done()]
+        if pending:
+            await asyncio.gather(*pending)
+        return result
+
+    result = asyncio.run(flight_then_hard_restart())
+
+    assert result["stop_half"] == "blocked", (
+        "the entry must not refuse a hard restart while a flight is live; "
+        "what is blocked below is the start half, refused on its own terms"
+    )
+    assert not any(c[0] == "start" for c in harness.calls)
+    assert power._SOFT_STOPS_IN_FLIGHT == {}
+
+
 def test_stop_vm_description_carries_the_fire_and_forget_contract() -> None:
     """The full contract must live in the description, not only in the code.
 
@@ -1105,6 +1234,34 @@ def test_stop_vm_description_carries_the_fire_and_forget_contract() -> None:
     assert "in flight" in text and "joins" in text, (
         "must teach that a repeat soft call joins the shutdown in flight "
         "instead of spawning a second vmrun process"
+    )
+    assert "refused" in text, (
+        "the opposite direction of the flight must be described too: a start "
+        "issued during the shutdown is refused, and the caller needs to know "
+        "the wait it is being asked for has an end stated as vm_status"
+    )
+
+
+def test_start_vm_description_carries_the_refusal_contract() -> None:
+    """The start refusal is part of the tool's published behaviour.
+
+    A refusal the description never mentions reads as an error, not a rule.
+    The description must say that a start issued during a soft shutdown is
+    refused, that the wait has an end stated as vm_status 'stopped' -- and
+    name the override, because a refusal that hides its escape hatch is a
+    lockout.
+    """
+
+    async def go() -> dict[str, Any]:
+        return {t.name: t.description or "" for t in await server.mcp.list_tools()}
+
+    descriptions = asyncio.run(go())
+    text = descriptions["start_vm"].lower()
+
+    assert "refused" in text or "refuse" in text, "the refusal must be published"
+    assert "vm_status" in text, "the wait must be observable, not open-ended"
+    assert "hard" in text and "never refused" in text, (
+        "the override must be named in the same breath as the refusal"
     )
 
 
@@ -1133,4 +1290,8 @@ def test_restart_vm_description_carries_the_handoff_contract() -> None:
     )
     assert "null" in text and "handoff" in text, (
         "must teach that started: null is the handoff, not an omission"
+    )
+    assert "never refused" in text, (
+        "the hard override must be published as open: a refusal on the soft "
+        "path whose escape the description hides would be a lockout"
     )

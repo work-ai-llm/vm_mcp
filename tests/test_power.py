@@ -450,15 +450,69 @@ def test_stop_hard_uses_the_hard_mode(lab, fake_vmrun) -> None:
 
 
 def test_stop_rejects_a_mode_that_is_not_a_mode(lab, fake_vmrun) -> None:
-    """Fail loudly on a typo. An unrecognised mode silently treated as `soft`
-    would mean a caller asking to cut power got a graceful shutdown instead."""
+    """Fail loudly on a typo -- as a ToolError, not an opaque crash.
+
+    `power.stop`'s own ValueError used to escape past the tool layer: the
+    caller's result carried no reason, while the same call on a bad *name*
+    produced a well-written error. The mode check is now a tool-level guard
+    and the message has to carry what the agent needs to continue: the value
+    it got, and both values that exist. An unrecognised mode silently treated
+    as `soft` would mean a caller asking to cut power got a graceful shutdown
+    instead, so it must be refused outright.
+    """
     harness = fake_vmrun()
 
-    with pytest.raises(ValueError) as excinfo:
+    with pytest.raises(ToolError) as excinfo:
         call(server.stop_vm, uuid=DC01_UUID, mode="harder")
 
     assert harness.calls == []
-    assert "soft" in str(excinfo.value)
+    assert "harder" in str(excinfo.value), "the bad value must be echoed"
+    assert "soft" in str(excinfo.value) and "hard" in str(excinfo.value), (
+        "the valid choices must be named"
+    )
+
+
+def test_stop_vm_accepts_mode_in_any_case(lab, fake_vmrun) -> None:
+    """`Hard` behaviour, not punctuation, is what the caller asked for.
+
+    A model that writes `Hard` is making an unambiguous request; refusing it
+    over case would turn the guard into a spelling test. The result echoes
+    the mode as the lowercase value that was actually issued, so what ran is
+    always readable from the result.
+    """
+    harness = fake_vmrun()
+
+    result = call_powered(server.stop_vm, lab, uuid=DC01_UUID, mode="Hard")
+
+    assert result["mode"] == "hard"
+    assert ["stop", lab["dc01"].path, "hard"] in harness.calls
+
+
+def test_restart_vm_validates_mode_the_same_way(lab, fake_vmrun) -> None:
+    """One mode guard for both power tools, on purpose.
+
+    `restart_vm` takes the same `mode` as `stop_vm`, so an invalid value gets
+    the same treatment: a ToolError naming the choices, with nothing issued.
+    And an all-caps `HARD` on an already-stopped VM -- the cheap full-cycle
+    path -- is accepted: the no-op stop confirms the VM down and the start
+    runs, so case is never the difference between a restart and an error.
+    """
+    harness = fake_vmrun()
+
+    with pytest.raises(ToolError) as excinfo:
+        call(server.restart_vm, uuid=DC01_UUID, mode="gracefully")
+
+    assert harness.calls == []
+    assert "soft" in str(excinfo.value) and "hard" in str(excinfo.value)
+
+    result = call(server.restart_vm, uuid=DC01_UUID, mode="HARD")
+
+    assert result["mode"] == "hard"
+    # The VM here is already off, so the stop half is the confirmed no-op
+    # short-circuit and vmrun never sees a stop command at all; the start
+    # runs and gets read back.
+    assert harness.calls == [["list"], ["start", lab["dc01"].path, "nogui"], ["list"]]
+    assert result["started"]["power_state"] == "running"
 
 
 def test_soft_stop_is_not_confirmation(lab, fake_vmrun) -> None:
@@ -909,7 +963,10 @@ def test_stop_and_restart_default_to_soft_in_the_schema() -> None:
     """The published default, not just the Python signature.
 
     A client that renders defaults from the schema would otherwise display
-    something other than what actually happens.
+    something other than what actually happens. The two values are also
+    published as an enum: a model choosing mode sees the choices before it
+    sends anything, which is what makes the case-insensitive guard behind it
+    a safety net rather than something a caller trips on.
     """
 
     async def go() -> dict[str, Any]:
@@ -918,7 +975,9 @@ def test_stop_and_restart_default_to_soft_in_the_schema() -> None:
     schemas = asyncio.run(go())
 
     for name in ("stop_vm", "restart_vm"):
-        assert schemas[name]["properties"]["mode"].get("default") == "soft"
+        schema = schemas[name]["properties"]["mode"]
+        assert schema.get("default") == "soft"
+        assert schema.get("enum") == ["soft", "hard"]
 
 
 def test_stop_vm_description_carries_the_fire_and_forget_contract() -> None:

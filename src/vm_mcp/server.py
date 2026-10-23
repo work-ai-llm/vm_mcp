@@ -67,7 +67,7 @@ import argparse
 import re
 import sys
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import psutil
 from mcp.server import MCPServer
@@ -727,6 +727,28 @@ def _identity(vm: roster.RegisteredVm) -> dict[str, Any]:
     return {"name": vm.name, "uuid": vm.uuid, "vmx": vm.vmx}
 
 
+def _power_mode(mode: str) -> str:
+    """Validate a `mode` argument before any power tool touches the guest.
+
+    `vmrun`'s second stop argument is fixed-wildcard-lowercase and
+    `power.stop` would raise a bare ValueError on anything else, which used to
+    escape past the tool layer as an opaque failure with no guidance. The
+    schema now advertises the two choices as an enum, and this is the guard
+    behind it: mode is matched case-insensitively (`Hard` from a chatty model
+    is the request it meant, and refusing it over case would be punctuation
+    enforcement), while anything else is a ToolError that names both valid
+    values -- the message an agent has to read to continue.
+    """
+    lowered = (mode or "").casefold()
+    if lowered not in (STOP_SOFT, STOP_HARD):
+        raise ToolError(
+            f"invalid mode {mode!r}: the valid values are 'soft' (default -- "
+            "request a graceful shutdown) and 'hard' (cut power at once; risk "
+            "of guest filesystem damage)."
+        )
+    return lowered
+
+
 @mcp.tool(annotations=MUTATES)
 async def start_vm(uuid: str | None = None, name: str | None = None) -> dict[str, Any]:
     """Power on one VM. Does not wait for the guest to finish booting.
@@ -773,7 +795,7 @@ async def start_vm(uuid: str | None = None, name: str | None = None) -> dict[str
 async def stop_vm(
     uuid: str | None = None,
     name: str | None = None,
-    mode: str = STOP_SOFT,
+    mode: Literal["soft", "hard"] = STOP_SOFT,
 ) -> dict[str, Any]:
     """Request a power-off of one VM. Soft returns at once; hard cuts power.
 
@@ -786,7 +808,9 @@ async def stop_vm(
         mode: `soft` (default) asks the guest OS to shut itself down, letting it
             unmount filesystems cleanly, and **returns before the shutdown
             finishes** -- see Returns. `hard` cuts power immediately, the
-            equivalent of pulling the plug.
+            equivalent of pulling the plug. Matched case-insensitively; the
+            schema advertises the two values, and anything else is rejected
+            with an error that names them.
 
     Returns:
         A dict with:
@@ -822,6 +846,7 @@ async def stop_vm(
         situation `guest_health` is for.
     """
     vm = _resolve_for_power(uuid, name)
+    mode = _power_mode(mode)
     outcome = await power.stop(vm.vmx, mode=mode)
     return {**_identity(vm), "mode": mode, **outcome.as_dict()}
 
@@ -830,7 +855,7 @@ async def stop_vm(
 async def restart_vm(
     uuid: str | None = None,
     name: str | None = None,
-    mode: str = STOP_SOFT,
+    mode: Literal["soft", "hard"] = STOP_SOFT,
 ) -> dict[str, Any]:
     """Restart one VM: stop, then start. The two halves stay separate.
 
@@ -848,7 +873,8 @@ async def restart_vm(
             timeout that a slow shutdown would blow anyway.
             `hard` -- fast enough to do the whole cycle in one call: cut
             power (~2s), power back on (~2-3s), return once powered on is
-            confirmed.
+            confirmed. Like `stop_vm`, `mode` is matched case-insensitively,
+            and anything outside the two values is rejected with both named.
 
     Returns:
         A dict with:
@@ -870,6 +896,7 @@ async def restart_vm(
         having cleanly stopped* and is running on stale state.
     """
     vm = _resolve_for_power(uuid, name)
+    mode = _power_mode(mode)
     stopped, started = await power.restart(vm.vmx, mode=mode)
     payload = {**_identity(vm), "mode": mode, "stopped": stopped.as_dict()}
     if started is not None:

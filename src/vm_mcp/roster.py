@@ -75,6 +75,7 @@ changes on a Vagrant rebuild and means nothing outside that folder.
 from __future__ import annotations
 
 import difflib
+import os
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -311,7 +312,12 @@ def inventory_path() -> Path:
     Derived from the user profile rather than hardcoded, so the server works
     for whoever runs it -- which is the entire premise of reading the registry
     instead of shipping a static allowlist.
+
+    Can be overridden via VMWARE_INVENTORY_PATH environment variable.
     """
+    env_path = os.environ.get("VMWARE_INVENTORY_PATH")
+    if env_path:
+        return Path(os.path.expandvars(env_path))
     return Path.home() / "AppData" / "Roaming" / "VMware" / "inventory.vmls"
 
 

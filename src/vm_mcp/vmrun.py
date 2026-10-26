@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,8 +55,9 @@ logger = logging.getLogger(__name__)
 
 # Verified present on the M0 host. Overridable per-call via run_vmrun(executable=)
 # so tests never have to depend on this path.
+# Can be overridden via VMWARE_VMRUN_PATH environment variable.
 VMRUN_PATH = Path(
-    r"C:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe"
+    os.environ.get("VMWARE_VMRUN_PATH", r"C:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe")
 )
 
 # Timeouts are per-command and generous. `list` measured 0.55s and

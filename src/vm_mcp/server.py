@@ -64,6 +64,7 @@ compensate, which is what lets one venv serve every worktree.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from pathlib import Path
@@ -94,9 +95,10 @@ __version__ = "0.1.0"
 # Loopback is the default because binding 0.0.0.0 would expose a server that can
 # inspect a domain controller lab to anything that can route to this machine.
 # Widening the bind has to be a deliberate flag.
-DEFAULT_HTTP_HOST = "127.0.0.1"
-DEFAULT_HTTP_PORT = 8765
-DEFAULT_HTTP_PATH = "/mcp"
+# Can be overridden via MCP_HTTP_HOST, MCP_HTTP_PORT, MCP_HTTP_PATH environment variables.
+DEFAULT_HTTP_HOST = os.environ.get("MCP_HTTP_HOST", "127.0.0.1")
+DEFAULT_HTTP_PORT = int(os.environ.get("MCP_HTTP_PORT", "8765"))
+DEFAULT_HTTP_PATH = os.environ.get("MCP_HTTP_PATH", "/mcp")
 
 # `.vmx` is a flat key = "value" file. Keys are matched case-insensitively
 # because real files disagree with themselves: `wazuh-4.7.5.vmx` has
@@ -1107,6 +1109,13 @@ def _run_transport(run: Callable[[], None]) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
+    # Load .env file if present (for VMWARE_VMRUN_PATH, VMWARE_INVENTORY_PATH, etc.)
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass  # python-dotenv not installed, env vars must be set externally
+
     args = parse_args(argv)
 
     # Read the registry once here, so a broken one is reported at boot instead of

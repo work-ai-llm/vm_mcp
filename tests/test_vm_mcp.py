@@ -621,26 +621,43 @@ def test_stale_registry_entry_degrades_instead_of_failing(
 # --- annotations ---------------------------------------------------------
 
 
-def test_every_tool_is_advertised_as_read_only(lab, vmrun) -> None:
-    """Every tool in the set, not a hand-maintained pair.
+def test_every_tool_is_described_and_annotated(lab, vmrun) -> None:
+    """Every tool has a description and annotations. The read-only claim is now
+    per-tool, because as of M2 it is no longer true of the whole surface.
 
     This started as `test_both_tools_...` asserting exactly `list_vms` and
     `vm_status`, which is a change-detector pointed the wrong way: adding
-    `host_resources` had to edit this test to keep it green, and deleting a tool
-    would have satisfied it. The set is asserted as a superset instead, and
-    exhaustively -- any tool added later is covered without being named here.
+    `host_resources` had to edit this test to keep it green, and a tool deleted
+    from the set would have satisfied it. It then asserted that *every* tool is
+    read-only, which was correct while the surface was read-only and became
+    false the moment `start_vm` landed: asserting the property over the whole
+    set would have failed on a correct implementation. So the read-only claim
+    is checked per tool instead -- `test_power.py` covers the mutating tools'
+    own annotations. The set is still enumerated from the server, so a tool
+    added later is covered without being named here.
     """
     async def go() -> list[Any]:
         return list(await server.mcp.list_tools())
 
     tools = asyncio.run(go())
 
-    assert {"list_vms", "vm_status", "host_resources"} <= {t.name for t in tools}
     for tool in tools:
         assert tool.description, f"{tool.name} has no description"
-        assert tool.annotations is not None
-        assert tool.annotations.read_only_hint is True
-        assert tool.annotations.destructive_hint is False
+        assert tool.annotations is not None, f"{tool.name} has no annotations"
+        assert isinstance(tool.annotations.read_only_hint, bool)
+        assert isinstance(tool.annotations.destructive_hint, bool)
+
+    read_only = {"list_vms", "vm_status", "host_resources"}
+    mutating = {"start_vm", "stop_vm", "restart_vm"}
+    assert read_only <= {t.name for t in tools}
+    assert mutating <= {t.name for t in tools}
+
+    for tool in tools:
+        if tool.name in read_only:
+            assert tool.annotations.read_only_hint is True, (
+                f"{tool.name} only reads; it must say so"
+            )
+            assert tool.annotations.destructive_hint is False
 
 
 def test_vm_status_accepts_either_identifier_and_needs_neither() -> None:

@@ -67,15 +67,21 @@ import argparse
 import re
 import sys
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import psutil
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
-from vm_mcp import health, hostinfo, roster
-from vm_mcp.vmrun import VmrunUnavailable, list_running_vmx, tools_state
+from vm_mcp import health, hostinfo, power, roster
+from vm_mcp.vmrun import (
+    STOP_HARD,
+    STOP_SOFT,
+    VmrunUnavailable,
+    list_running_vmx,
+    tools_state,
+)
 
 __version__ = "0.1.0"
 
@@ -113,16 +119,41 @@ mcp = MCPServer(
     name="vmware",
     version=__version__,
     instructions=(
-        "Inspects a local VMware Workstation lab: Windows domain controllers, "
-        "servers, and Linux hosts. Call list_vms to see what is registered and "
-        "what is running, vm_status for the detail of one VM, guest_health to "
-        "tell a powered-on guest from one that is actually answering, and "
-        "host_resources to see what the VMs cost the host. No tool changes a "
-        "VM's state."
+        "Inspects and controls a local VMware Workstation lab: Windows domain "
+        "controllers, servers, and Linux hosts. Call list_vms to see what is "
+        "registered and what is running, then vm_status for the detail of one "
+        "VM, guest_health to tell a powered-on guest from one that is actually "
+        "answering, and host_resources to see what the VMs cost the host. "
+        "start_vm, stop_vm and restart_vm change power state; they act on a "
+        "single VM named or uuid'd by the caller, never on a path, and never on "
+        "more than one machine. A start reports a VM as powered on well before "
+        "its guest is usable -- expect roughly 150s more -- so do not treat "
+        "'running' as 'ready'. A soft stop_vm and a soft restart_vm return "
+        "power_state 'stopping' as soon as the shutdown is in flight and do "
+        "not wait for it; confirm the shutdown with the read-only tools "
+        "before treating the machine as off, never by re-issuing the stop."
     ),
 )
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False)
+
+# Powering on changes machine state but destroys nothing, and every read-only
+# tool's advice is "start this VM" -- so an agent working within a read-only grant
+# is routinely blocked by an accurate annotation. `destructive_hint` is the one
+# that carries risk, and it is False here for a real reason: nothing is lost.
+MUTATES = ToolAnnotations(read_only_hint=False, destructive_hint=False)
+
+# A hard stop is the power cord. `restart_vm` is marked destructive for the same
+# reason even in its graceful form: an unclean shutdown is what damages a guest
+# filesystem, and a caller that is told "destructive" and proceeds deliberately
+# is behaving exactly as intended.
+DESTRUCTIVE = ToolAnnotations(read_only_hint=False, destructive_hint=True)
+
+# Non-lab VMs are registered on this host too -- a Wazuh SIEM holding 8 GB, among
+# them -- and the registry cannot tell a lab member from an appliance. So every
+# mutating tool names the resolved VM in its result and in the registry-verified
+# path, and the client is expected to gate these by default rather than trust an
+# agent to have checked first. See the README's security posture section.
 
 
 def _norm_path(path: str) -> str:
@@ -651,6 +682,313 @@ async def guest_health(
     return result
 
 
+def _resolve_for_power(uuid: str | None, name: str | None) -> roster.RegisteredVm:
+    """Map a caller identifier to exactly one VM, or fail before anything runs.
+
+    Every mutating tool starts here, and this is the security boundary for all of
+    them. A caller never supplies a path -- `vmrun` addresses VMs by absolute
+    `.vmx` path, so a tool that accepted one would be an arbitrary-file-primitive
+    with a power switch attached. `roster.resolve` returns only paths the VMware
+    registry itself lists, which is what makes `stop_vm("../../Windows/System32")`
+    a plain error instead of a disaster.
+
+    The `.vmx` existence check is here rather than deeper because a registry is a
+    cache written by the GUI: it can name a VM whose `.vmx` was moved or deleted.
+    Failing before the command, rather than after, is what keeps a stale entry
+    from becoming a confusing vmrun error.
+    """
+    try:
+        vm = roster.resolve(uuid=uuid, name=name)
+    except roster.RosterError as exc:
+        # Covers UnknownVm, AmbiguousName and IdentifierMismatch. Each already
+        # carries a message written for the caller, including what *is*
+        # available when the identifier did not match.
+        raise ToolError(str(exc)) from exc
+
+    if not Path(vm.vmx).is_file():
+        raise ToolError(
+            f"{vm.name!r} is registered with VMware but its .vmx is missing: "
+            f"{vm.vmx}. The registry is stale for this entry, or the VM was "
+            "moved or deleted. Nothing was started. Call list_vms for the "
+            "current roster."
+        )
+
+    return vm
+
+
+def _identity(vm: roster.RegisteredVm) -> dict[str, Any]:
+    """The name, uuid and path of the VM acted on, echoed back in every result.
+
+    Present in every mutating result, including failures, because the one thing a
+    caller must be able to check is *which machine this actually did*. A tool that
+    powered something off and returned a bare `{"ok": true}` would leave an agent
+    unable to verify it stopped the right VM.
+    """
+    return {"name": vm.name, "uuid": vm.uuid, "vmx": vm.vmx}
+
+
+def _power_mode(mode: str) -> str:
+    """Validate a `mode` argument before any power tool touches the guest.
+
+    `vmrun`'s second stop argument is fixed-wildcard-lowercase and
+    `power.stop` would raise a bare ValueError on anything else, which used to
+    escape past the tool layer as an opaque failure with no guidance. The
+    schema now advertises the two choices as an enum, and this is the guard
+    behind it: mode is matched case-insensitively (`Hard` from a chatty model
+    is the request it meant, and refusing it over case would be punctuation
+    enforcement), while anything else is a ToolError that names both valid
+    values -- the message an agent has to read to continue.
+    """
+    lowered = (mode or "").casefold()
+    if lowered not in (STOP_SOFT, STOP_HARD):
+        raise ToolError(
+            f"invalid mode {mode!r}: the valid values are 'soft' (default -- "
+            "request a graceful shutdown) and 'hard' (cut power at once; risk "
+            "of guest filesystem damage)."
+        )
+    return lowered
+
+
+def _refuse_during_shutdown(vm: roster.RegisteredVm, override: str) -> None:
+    """Refuse anything that would power a shutting-down VM back up.
+
+    While a soft shutdown is in flight the stop tools dedupe it, but a
+    *start* would fight it: a machine being told to go down and being told
+    to come up at the same time is the one confused state the power tools
+    refuse to create. `power.shutdown_in_flight` reports the flight's age,
+    and the refusal carries it -- interrupting a 5-second-old request and a
+    10-minute wedged one are different goings-on, and the message should let
+    the caller tell them apart. `hard` is the documented escape hatch, so
+    the override line sits in the same breath as the refusal: never a
+    lockout.
+    """
+    age = power.shutdown_in_flight(vm.vmx)
+    if age is not None:
+        raise ToolError(
+            f"a soft shutdown was issued for {vm.name!r} {age:.0f}s ago and "
+            "is still in flight -- starting now would fight it. Wait for "
+            f"vm_status to read 'stopped', then call again. {override}"
+        )
+
+
+@mcp.tool(annotations=MUTATES)
+async def start_vm(uuid: str | None = None, name: str | None = None) -> dict[str, Any]:
+    """Power on one VM. Does not wait for the guest to finish booting.
+
+    Identifies the VM by `uuid` (preferred) or `name`, exactly as `vm_status` does,
+    and resolves it against the VMware registry. The VM is started with `nogui`,
+    so no console window appears.
+
+    Args:
+        uuid: The VM's hardware UUID, as reported by `list_vms`.
+        name: Name or label of the VM. Matched loosely, so `GOAD-DC01` finds the
+            VM the registry calls `provider: GOAD-DC01`.
+
+    Returns:
+        A dict with:
+          name, uuid, vmx: the VM that was acted on, echoed back so the caller
+              can confirm it was the right one.
+          power_state: `running` or `stopped`, **read back from `vmrun list`**
+              after the start, not taken from the start command's exit code.
+          confirmed: True only if that read-back happened. If False, the VM's
+              state is unknown and `vmrun_error` says why.
+          waited_s: How long the confirmation poll took.
+
+        **`power_state: running` means powered on, not usable.** Measured on this
+        host: the start command returns in ~2s while the guest needs a further
+        **~156s** before its OS finishes booting and services answer. Nothing in
+        this result says the guest is ready, because nothing here has waited to
+        find out. To wait for readiness, poll `vm_status` and watch `tools_state`
+        go to `running`; on a slow guest expect roughly 150s of that. If
+        `tools_state` stays `installed` noticeably longer than this guest's
+        usual boot, assume the guest is stuck -- inspect the console; this
+        tool cannot see the guest screen.
+
+        A start that reports `power_state: stopped` with `confirmed: true` is a
+        genuine failure -- `vmrun` claimed success and the VM did not appear.
+
+    Raises:
+        ToolError: while a soft shutdown for this VM is still in flight -- a
+            start issued during a shutdown is a machine both coming up and
+            going down. Wait for `vm_status`'s `stopped`, or take the machine
+            down right away with `stop_vm` and mode `'hard'` (the deliberate
+            override; it is never refused).
+
+    Note:
+        This tool starts a machine. It does not provision it, and it does not
+        start anything else on the host.
+    """
+    vm = _resolve_for_power(uuid, name)
+    _refuse_during_shutdown(
+        vm,
+        "To take the machine fully down right away, stop_vm with mode 'hard' "
+        "is the deliberate override, and it is never refused.",
+    )
+    outcome = await power.start(vm.vmx)
+    return {**_identity(vm), **outcome.as_dict()}
+
+
+@mcp.tool(annotations=DESTRUCTIVE)
+async def stop_vm(
+    uuid: str | None = None,
+    name: str | None = None,
+    mode: Literal["soft", "hard"] = STOP_SOFT,
+) -> dict[str, Any]:
+    """Request a power-off of one VM. Soft returns at once; hard cuts power.
+
+    Identifies the VM by `uuid` (preferred) or `name` and resolves it against the
+    VMware registry.
+
+    Args:
+        uuid: The VM's hardware UUID, as reported by `list_vms`.
+        name: Name or label of the VM.
+        mode: `soft` (default) asks the guest OS to shut itself down, letting it
+            unmount filesystems cleanly, and **returns before the shutdown
+            finishes** -- see Returns. `hard` cuts power immediately, the
+            equivalent of pulling the plug. Matched case-insensitively; the
+            schema advertises the two values, and anything else is rejected
+            with an error that names them.
+
+    Returns:
+        A dict with:
+          name, uuid, vmx: the VM that was acted on.
+          mode: the mode actually used.
+          power_state:
+            `stopping` (soft): a graceful shutdown was requested and is being
+                carried out in the background. This is NOT an observed state
+                and `confirmed` is False. Shutting down typically takes
+                30-90s on this lab (measured 26-61s) and a busy Windows guest
+                can take longer. Confirm the result before acting on the
+                machine: poll vm_status (or list_vms) until `power_state` is
+                `stopped`. Re-reading is free; do not re-issue this tool just
+                to check state. A second soft call while one is in flight
+                **joins** the first rather than spawning another vmrun
+                process against the same guest. A start issued during this
+                flight is refused -- starting would fight the shutdown; see
+                start_vm. mode='hard' is never refused.
+            `stopped` (hard): power is verifiably off, read back from
+                `vmrun list`. The VM was gone from the hypervisor list when
+                this was confirmed.
+          confirmed: True only when the state above was actually observed.
+          waited_s: How long the call itself waited (small always; a soft
+              stop does NOT block on the guest).
+          detail: Present when there is something to act on or to wait out.
+
+        If the VM is still running several minutes after a soft request and
+        you intend it off, that guest has not shut down -- re-issuing soft
+        will not speed that up. `mode: "hard"` cuts power at once; it risks
+        guest filesystem damage, so it is never chosen for you: the stop is
+        soft until you deliberately ask for hard.
+
+    Note:
+        `hard` is destructive and this tool is annotated as such. On a Windows
+        domain controller it risks guest filesystem damage. Prefer `soft`
+        unless the guest is known to be wedged -- which is exactly the
+        situation `guest_health` is for.
+    """
+    vm = _resolve_for_power(uuid, name)
+    mode = _power_mode(mode)
+    outcome = await power.stop(vm.vmx, mode=mode)
+    return {**_identity(vm), "mode": mode, **outcome.as_dict()}
+
+
+@mcp.tool(annotations=DESTRUCTIVE)
+async def restart_vm(
+    uuid: str | None = None,
+    name: str | None = None,
+    mode: Literal["soft", "hard"] = STOP_SOFT,
+) -> dict[str, Any]:
+    """Restart one VM: stop, then start. The two halves stay separate.
+
+    Identifies the VM by `uuid` (preferred) or `name` and resolves it against the
+    VMware registry. Takes the same `mode` as `stop_vm`, applied to the stop.
+
+    Args:
+        uuid: The VM's hardware UUID, as reported by `list_vms`.
+        name: Name or label of the VM.
+        mode: `soft` (default) -- the call issues the graceful shutdown, then
+            hands the start half back to you: poll `vm_status` until the VM
+            shows `stopped` (typically 30-90s), then call start_vm. This is
+            deliberate -- starting a VM that is still shutting down is a state
+            this tool refuses to create, and the client enforces a request
+            timeout that a slow shutdown would blow anyway.
+            `hard` -- fast enough to do the whole cycle in one call: cut
+            power (~2s), power back on (~2-3s), return once powered on is
+            confirmed. Like `stop_vm`, `mode` is matched case-insensitively,
+            and anything outside the two values is rejected with both named.
+
+    Raises:
+        ToolError: with `mode: "soft"` while a soft shutdown for this VM is
+            already in flight -- a restart cannot be layered onto another
+            shutdown, so it refuses rather than silently re-anchor to it.
+            `mode: "hard"` is the deliberate override that is never refused:
+            it cuts power, confirms the machine away, and brings it back up
+            in one call.
+
+    Returns:
+        A dict with:
+          name, uuid, vmx: the VM that was acted on.
+          mode: the mode actually used.
+          stop_half: `"done"`, `"handoff"` or `"blocked"` -- which shape the
+              result has, stated outright instead of being inferred from
+              which other keys are present:
+
+              * `"done"` -- both halves ran in this call. The VM was found
+                already off (no stop needed, start immediate) or a `hard`
+                stop confirmed and the start ran. `started` is the
+                `start_vm` result.
+              * `"handoff"` -- the soft shutdown is in flight; the result
+                has `started: null` and the stop half's detail tells you to
+                call start_vm once vm_status reads `stopped`. That null is
+                the design, not an omission, and `stop_half` is how you
+                distinguish it from a missing key.
+              * `"blocked"` -- the hard stop did not confirm, so the start
+                was refused. `started` carries the refusal and its reason.
+          stopped: the `stop_vm` result (`power_state`, `confirmed`,
+              `waited_s`, any `detail`). With `mode: "soft"` this is
+              `power_state: "stopping"`, `confirmed: false` and a `detail`
+              that tells you to call start_vm when vm_status shows stopped.
+          started: the `start_vm` result when one ran; **null** when the
+              start belongs to the caller (see `stop_half`).
+
+        A provenance note the field replaces having to guess: `started` is
+        always present, so clients that walk the object never have to choose
+        between absent-key semantics and null semantics -- `stop_half` says
+        which shape applies.
+
+        When `started` holds a real start result, the usual rule applies:
+        `power_state == "running"` means powered on, not usable -- expect
+        roughly 150s more before the guest answers. That half is reported
+        even when the stop was unremarkable, because the case worth seeing is
+        a machine that came back up *without having cleanly stopped* and is
+        running on stale state.
+
+        As in `start_vm`: if `tools_state` stays `installed` noticeably
+        longer than this guest's usual boot, assume the guest is stuck --
+        inspect the console; this tool cannot see the guest screen.
+    """
+    vm = _resolve_for_power(uuid, name)
+    mode = _power_mode(mode)
+    if mode != "hard":
+        # `hard` is the documented escape hatch: never refused, at the entry
+        # either. It cuts power, confirms the VM away and starts it back up
+        # inside the call, so the flight that prompted it is over by then.
+        _refuse_during_shutdown(
+            vm,
+            "restart_vm with mode 'hard' is the deliberate override: it cuts "
+            "power, confirms the machine away, and brings it back up in one "
+            "call.",
+        )
+    stopped, started, stop_half = await power.restart(vm.vmx, mode=mode)
+    return {
+        **_identity(vm),
+        "mode": mode,
+        "stop_half": stop_half,
+        "stopped": stopped.as_dict(),
+        "started": started.as_dict() if started is not None else None,
+    }
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse the command line. Defaults come from the module constants above.
 
@@ -691,9 +1029,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def http_banner(host: str, port: int, path: str) -> str:
     """The startup message for HTTP mode: settings, URL, and a security warning.
 
-    Printed on every HTTP start. There is no authentication on this transport,
-    so anyone who can reach the socket can call every tool on it -- and the tool
-    surface is going to include power-off. Worth saying when it becomes true.
+    Printed on every HTTP start. The warning is no longer hypothetical -- since
+    M2 this endpoint can power off a domain controller, and anyone who can reach
+    the socket can ask it to. Worth saying out loud on every launch rather than
+    once in a README.
     """
     if host in ("127.0.0.1", "localhost", "::1"):
         exposure = "bound to loopback, so only processes on this machine can reach it"
@@ -716,11 +1055,13 @@ def http_banner(host: str, port: int, path: str) -> str:
             "There is no token,",
             "  no TLS and no client identity check, so anything that can reach "
             "the socket can call",
-            "  every tool this server exposes. The tools shipped so far are "
-            "read-only, but once the",
-            "  mutating tools land, this endpoint will be able to power off a "
-            "domain controller and",
-            f"  anyone who can reach it can ask for that. Currently {exposure}.",
+            "  every tool this server exposes -- including stop_vm and "
+            "restart_vm, which can",
+            "  power off a domain controller and, in hard mode, risk guest "
+            "filesystem damage.",
+            f"  Currently {exposure}. Authentication is a tracked follow-up and "
+            "is not done yet;",
+            "  gate the mutating tools client-side until it is.",
             "",
         ]
     )

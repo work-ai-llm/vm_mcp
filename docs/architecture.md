@@ -93,7 +93,7 @@ case-insensitively. An ambiguous match is an error listing the candidates, never
 a guess. UUID is the only unambiguous key — it equals the `.vmx` `uuid.bios` and
 survives a rename — and a UUID that matches nothing is an error, never a fallback
 to name matching. The registry-backed resolution is the security boundary every
-mutating tool will sit behind (see [`security.md`](security.md)).
+mutating tool sits behind (see [`security.md`](security.md)).
 
 ## How the server invokes `vmrun` (#8)
 
